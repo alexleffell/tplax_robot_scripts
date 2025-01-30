@@ -245,7 +245,7 @@ def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=True):
     robot_df.attrs['corner_locs'] = corner_locs
     robot_df.attrs['n_nodes'] = n_nodes
     # Save DataFrame to CSV with attributes in the header
-    with open(file[0:-4]+'_robot.csv', "w") as f:
+    with open(core_path+'_robot.csv', "w") as f:
         for key, value in robot_df.attrs.items():
             f.write(f"# {key}: {value}\n")  # Write metadata as comments
         robot_df.to_csv(f, index=False)
