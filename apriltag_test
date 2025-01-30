@@ -1,0 +1,80 @@
+import cv2
+import apriltag
+import numpy as np
+from matplotlib import pyplot as plt
+import ffmpeg
+
+import opencv_jupyter_ui as jcv2
+# from google.colab.patches import cv2_imshow
+import os
+import re
+import glob
+import ipywidgets as widgets
+from pathlib import Path
+from IPython.display import display, clear_output
+
+dist = np.array([-0.02603106, -0.00486178,  0.00531722, -0.00361473,  0.00088188])
+mtx = np.array([[590.94387328, 0., 995.78382877],[0.,599.76908906, 995.93063031],[0., 0., 1.]])
+# Initialize the detector
+options = apriltag.DetectorOptions(families="tag36h11")
+detector = apriltag.Detector(options)
+
+# Camera intrinsic parameters (calibrated values)
+# Replace these with your camera's intrinsic parameters
+camera_matrix = mtx #np.array([[fx, 0, cx], [0, fy, cy], [0,  0,  1]])
+dist_coeffs = dist #np.array([0, 0, 0, 0])  # Assuming no lens distortion; update if calibrated.
+
+# Known dimensions of the AprilTag (in meters)
+tag_size = 0.05  # Example: 5 cm = 0.05 meters
+
+# Load an image
+image_path = "./Data/apriltag_test/apriltag_test.bmp"
+image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+# Detect AprilTags
+results = detector.detect(image)
+
+# Draw results and calculate distances
+for r in results:
+    (ptA, ptB, ptC, ptD) = r.corners
+    ptA = tuple(map(int, ptA))
+    ptB = tuple(map(int, ptB))
+    ptC = tuple(map(int, ptC))
+    ptD = tuple(map(int, ptD))
+
+    # Draw bounding box
+    cv2.line(image, ptA, ptB, (0, 255, 0), 2)
+    cv2.line(image, ptB, ptC, (0, 255, 0), 2)
+    cv2.line(image, ptC, ptD, (0, 255, 0), 2)
+    cv2.line(image, ptD, ptA, (0, 255, 0), 2)
+
+    # Draw the center
+    center = tuple(map(int, r.center))
+    cv2.circle(image, center, 5, (0, 0, 255), -1)
+    cv2.putText(image, f"ID: {r.tag_id}", center, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+    # Pose estimation (distance calculation)
+    obj_points = np.array([
+        [-tag_size / 2, -tag_size / 2, 0],  # Bottom-left corner
+        [ tag_size / 2, -tag_size / 2, 0],  # Bottom-right corner
+        [ tag_size / 2,  tag_size / 2, 0],  # Top-right corner
+        [-tag_size / 2,  tag_size / 2, 0]   # Top-left corner
+    ], dtype=np.float32)
+
+    img_points = np.array(r.corners, dtype=np.float32)
+
+    # Solve PnP (Perspective-n-Point) to find pose
+    success, rvec, tvec = cv2.solvePnP(obj_points, img_points, camera_matrix, dist_coeffs)
+    if success:
+        # tvec contains the translation vector, where tvec[2] is the distance
+        distance = tvec[2][0]
+        print(f"Tag ID: {r.tag_id}, Distance: {distance:.2f} meters")
+
+        # Annotate the image with the distance
+        cv2.putText(image, f"Distance: {distance:.2f} m", (center[0], center[1] + 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+# Display the image
+jcv2.imshow("AprilTag Detection", image)
+jcv2.waitKey(0)
+jcv2.destroyAllWindows()
