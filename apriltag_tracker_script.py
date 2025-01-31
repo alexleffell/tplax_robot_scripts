@@ -2,7 +2,7 @@
 import cv2
 import numpy as np
 from matplotlib import pyplot as plt
-import ffmpeg
+# import ffmpeg
 import argparse
 from pupil_apriltags import Detector
 import os
