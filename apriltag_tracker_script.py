@@ -20,6 +20,7 @@ parser = argparse.ArgumentParser(description="AprilTag Tracker")
 parser.add_argument("video_path", type=str, help="Path to the input video file")
 parser.add_argument("--n_nodes", type=int, default=7, help="Number of nodes (default: 4)")
 parser.add_argument("--nthreads", type=int, default=4, help="Number of threads (default: 1)")
+parser.add_argument("--output_video", type=bool, default=False, help="Generate tagged video?")
 
 args = parser.parse_args()
 
@@ -33,10 +34,15 @@ tag_size_corner = 0.037
 valid_tags = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,26,27,28,29]
 video_path = args.video_path
 core_path = video_path[0:-4] # remove filetype
-output_path = core_path + "_tagged.mp4"
+
+if args.output_video:
+    output_path = core_path + "_tagged.mp4"
+else:
+    output_path = None
 
 n_nodes = args.n_nodes
 nthreads = args.nthreads
+
 
 def interpolate_tracks(df, max_timesteps=1000):
     """
