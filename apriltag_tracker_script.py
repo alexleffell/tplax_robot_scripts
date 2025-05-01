@@ -18,9 +18,10 @@ start_time = time.time()
 
 parser = argparse.ArgumentParser(description="AprilTag Tracker")
 parser.add_argument("video_path", type=str, help="Path to the input video file")
-parser.add_argument("--n_nodes", type=int, default=7, help="Number of nodes (default: 4)")
-parser.add_argument("--nthreads", type=int, default=4, help="Number of threads (default: 1)")
+parser.add_argument("--n_nodes", type=int, default=7, help="Number of nodes (default: 7)")
+parser.add_argument("--nthreads", type=int, default=4, help="Number of threads (default: 4)")
 parser.add_argument("--output_video", type=bool, default=False, help="Generate tagged video?")
+parser.add_argument("--quad_dec", type=int, default=1, help="Generate tagged video?")
 
 args = parser.parse_args()
 
@@ -29,10 +30,11 @@ dist_coeffs = np.array([-3.77932235e-01,  1.81918585e-01, -9.30045382e-05,
 camera_matrix = np.array([[1.54009298e+03, 0.00000000e+00, 9.58442344e+02],
                          [0.00000000e+00, 1.54227003e+03, 1.00722240e+03],
                          [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
-tag_size = 0.025 
+tag_size = 0.045 # 0.025
 tag_size_corner = 0.037
 valid_tags = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,26,27,28,29]
 video_path = args.video_path
+qd = args.quad_dec
 core_path = video_path[0:-4] # remove filetype
 
 if args.output_video:
@@ -154,7 +156,7 @@ def print_interpolation_stats(stats):
     print(f"Average gap size: {stats['avg_gap_size']:.2f}")
     print(f"Maximum gap size: {stats['max_gap_size']}")
 
-def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=True):
+def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=False):
     """
     takes in a dataframe output by the tag tracker and reformats it to be more convenient. 
     Also:
@@ -215,7 +217,7 @@ def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=True):
                     pass
              
         for n in range(len(corner_ids)):
-            corner_locs.append( tuple(np.mean(values) for values in zip(*corners[n])))
+            corner_locs.append( tuple(float(np.mean(values)) for values in zip(*corners[n])))
             
     else:
         for t in range(total_frames):
@@ -245,7 +247,7 @@ def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=True):
                 
             robot_list.append(row) 
         for n in range(len(corner_ids)):
-            corner_locs.append( tuple(np.mean(values) for values in zip(*corners[n])))
+            corner_locs.append( tuple(float(np.mean(values)) for values in zip(*corners[n])))
 
     robot_df = pd.DataFrame(robot_list)
     robot_df.attrs['corner_locs'] = corner_locs
@@ -260,8 +262,8 @@ def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=True):
 at_detector = Detector(
                        families='tag16h5',
                        nthreads=nthreads,
-                       quad_decimate=2.,
-                       quad_sigma=.8,
+                       quad_decimate=qd,
+                       quad_sigma=0.,
                        refine_edges=1,
                        decode_sharpening=0.0,
                        debug=0)
@@ -379,7 +381,7 @@ if output_path:
     print(f"Output video saved to: {os.path.abspath(output_path)}")
     
 df = pd.DataFrame(results)
-df.to_csv(core_path + ".csv", index=False)
+df.to_csv(core_path + "_raw.csv", index=False)
 generate_dataframe(df, total_frames, fps, n_nodes=n_nodes, dual=True)
 print("Processing complete.")
 print("--- %s seconds ---" % (time.time() - start_time))
