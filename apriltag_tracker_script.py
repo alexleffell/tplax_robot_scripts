@@ -139,6 +139,7 @@ def calculate_interpolation_stats(original_df, interpolated_df):
     stats['max_interpolated_percentage'] = np.max(particle_stats)
     stats['avg_gap_size'] = np.mean(gap_sizes) if gap_sizes else 0
     stats['max_gap_size'] = np.max(gap_sizes) if gap_sizes else 0
+    print(original_df['node_id'].unique())
     
     return stats
 
@@ -227,6 +228,8 @@ def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=False):
             dy = center["y"].iloc[0] - one["y"].iloc[0]
             theta = np.arctan2(dy,dx)
             row = {'time':(t/fps), 'body_angle':theta}
+            centroid_x = 0
+            centroid_y = 0
             for n in range(n_nodes):
                 try:
                     node = df_int[(df_int["frame#"]==t) & (df_int["node_id"]==n)]
@@ -235,8 +238,20 @@ def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=False):
                     row[str(n)+'_z'] = node['z'].iloc[0]
                     row[str(n)+'_raw_angle'] = node['angle'].iloc[0]
                     row[str(n)+'_angle'] = node['angle'].iloc[0] - theta
+                    centroid_x += row[f'{n}_x']/n_nodes
+                    centroid_y += row[f'{n}_y']/n_nodes
                 except:
+                    print(f"Failed to add node {n} at frame {t}")
                     pass
+            try:
+                dx = row['0_x']-row['1_x']
+                dy = row['0_y']-row['1_y']
+                theta = np.arctan2(dy,dx)
+                row['body_angle'] = theta
+                row['centroid_x'] = centroid_x
+                row['centroid_y'] = centroid_y
+            except:
+                pass
             # get corner locations
             for n in range(len(corner_ids)):
                 try:
@@ -382,6 +397,6 @@ if output_path:
     
 df = pd.DataFrame(results)
 df.to_csv(core_path + "_raw.csv", index=False)
-generate_dataframe(df, total_frames, fps, n_nodes=n_nodes, dual=True)
+generate_dataframe(df, total_frames, fps, n_nodes=n_nodes, dual=False)
 print("Processing complete.")
 print("--- %s seconds ---" % (time.time() - start_time))
