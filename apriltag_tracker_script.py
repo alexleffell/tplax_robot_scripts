@@ -25,11 +25,17 @@ parser.add_argument("--quad_dec", type=int, default=1, help="Generate tagged vid
 
 args = parser.parse_args()
 
-dist_coeffs = np.array([-3.77932235e-01,  1.81918585e-01, -9.30045382e-05, 
-                        -2.08242888e-03,  -4.90966330e-02])
-camera_matrix = np.array([[1.54009298e+03, 0.00000000e+00, 9.58442344e+02],
-                         [0.00000000e+00, 1.54227003e+03, 1.00722240e+03],
-                         [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
+# dist_coeffs = np.array([-3.77932235e-01,  1.81918585e-01, -9.30045382e-05, 
+#                         -2.08242888e-03,  -4.90966330e-02])
+# camera_matrix = np.array([[1.54009298e+03, 0.00000000e+00, 9.58442344e+02],
+#                          [0.00000000e+00, 1.54227003e+03, 1.00722240e+03],
+#                          [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]]) # calibration matrix for air table
+
+dist_coeffs = np.array([[-2.96506920e-01, 3.89225183e-01, 1.04457586e-03, -5.88244099e-02, -1.14800693e+00]])
+camera_matrix = np.array([[3.21321589e+03, 0.00000000e+00, 1.49873167e+03],
+                          [0.00000000e+00, 3.01845806e+03, 1.01978088e+03],
+                          [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]])
+                          
 tag_size = 0.045 # 0.025
 tag_size_corner = 0.037
 valid_tags = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,26,27,28,29]
@@ -303,7 +309,7 @@ if output_path:
     output_dir = os.path.dirname(output_path)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
     out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
     print(f"Writing output to: {os.path.abspath(output_path)}")
 
@@ -380,6 +386,7 @@ while cap.isOpened() and frame_count < total_frames:
         new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w, h), 0, (w, h))
         undistorted_image = cv2.undistort(image, camera_matrix, dist_coeffs, None, new_camera_matrix)
         flip = cv2.flip(undistorted_image, 0)
+        flip = cv2.cvtColor(flip, cv2.COLOR_GRAY2BGR)
         out.write(flip)
 
     # Display current frame number
