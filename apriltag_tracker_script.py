@@ -232,7 +232,8 @@ def generate_dataframe(df, total_frames, fps, n_nodes=7, dual=False):
             one = df_int[(df_int["frame#"]==t) & (df_int["node_id"]==1)]
             dx = center["x"].iloc[0] - one["x"].iloc[0]
             dy = center["y"].iloc[0] - one["y"].iloc[0]
-            theta = np.arctan2(dy,dx)
+            # theta = np.arctan2(dy,dx)
+            theta = center["angle"].iloc[0]
             row = {'time':(t/fps), 'body_angle':theta}
             centroid_x = 0
             centroid_y = 0
