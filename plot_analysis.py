@@ -15,6 +15,18 @@ output directory. Figures:
   8. First few deformation mode shapes (quiver on the reference lattice)
   9. Caster-angle MSD vs lag with the diffusion fit
  10. PSDs: order parameter, KE/PE, and a modal-energy PSD heatmap
+ 11. Collective actuation (polarity-velocity coupling, actuation spectrum, condensation)
+ 12. Phase portraits (dominant mode pair + first two non-zero modes)
+ 13. Per-mode effective temperature (equipartition test)
+ 14. Chirality (body angular velocity + net polarization angle)
+ 15. Orientational autocorrelation + VACF
+ 16. Net active force vs CoM velocity
+ 17. Spatial polarity (bond alignment + ring winding)
+ 18. Per-node angular-velocity PSD (one curve per node)
+ 19. Pairwise node velocity correlation heatmap
+ 20. Pairwise heading angular-velocity correlation heatmap
+
+Every figure is footer-stamped and filename-tagged with the heading source and angle frame.
 
 Example
 -------
@@ -40,9 +52,17 @@ def parse_args():
     return p.parse_args()
 
 
-def savefig(fig, outdir, name, dpi, saved):
+def savefig(fig, outdir, name, dpi, saved, provenance="", tag=""):
+    # Stamp provenance (heading source + angle frame) on every figure and tag the filename,
+    # so lab-frame and body-frame runs are never confused.
+    if provenance:
+        fig.text(0.995, 0.005, provenance, ha="right", va="bottom", fontsize=7,
+                 color="0.4", family="monospace")
+    if tag:
+        root, ext = os.path.splitext(name)
+        name = f"{root}__{tag}{ext}"
     path = os.path.join(outdir, name)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     saved.append(path)
@@ -55,6 +75,16 @@ def main():
     outdir = args.outdir or (os.path.splitext(args.analysis_npz)[0] + "_plots")
     os.makedirs(outdir, exist_ok=True)
     saved = []
+
+    # Provenance: which heading source and which angle frame produced these results.
+    heading_source = str(d["heading_source"]) if "heading_source" in d.files else "?"
+    angle_frame = str(d["angle_frame"]) if "angle_frame" in d.files else "?"
+    provenance = f"heading source: {heading_source}   |   angle frame: {angle_frame}"
+    tag = f"{heading_source}_{angle_frame}"
+    print(f"Provenance: {provenance}")
+
+    def save(fig, name):
+        savefig(fig, outdir, name, args.dpi, saved, provenance=provenance, tag=tag)
 
     time = d["time"]
     nodes = d["nodes"]
@@ -73,7 +103,7 @@ def main():
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_title("Center-of-mass trajectory")
     fig.colorbar(lc, ax=ax, label="time")
     ax.legend()
-    savefig(fig, outdir, "01_com_trajectory.png", args.dpi, saved)
+    save(fig, "01_com_trajectory.png")
 
     # 2. CoM 2D PDF.
     hist, xe, ye = d["com_hist"], d["com_xedges"], d["com_yedges"]
@@ -82,16 +112,16 @@ def main():
                    aspect="equal", cmap="magma")
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_title("CoM probability density")
     fig.colorbar(im, ax=ax, label="density")
-    savefig(fig, outdir, "02_com_pdf.png", args.dpi, saved)
+    save(fig, "02_com_pdf.png")
 
-    # 3. Energies vs time.
+    # 3. Energies vs time (log scale; spikes span several decades).
     fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(time, d["KE_total"], label="KE", lw=1)
-    ax.plot(time, d["PE_total"], label="PE", lw=1)
-    ax.plot(time, d["E_total"], label="E total", lw=1.2, color="k")
-    ax.set_xlabel("time"); ax.set_ylabel("energy"); ax.set_title("Energies")
+    ax.semilogy(time, d["KE_total"], label="KE", lw=1)
+    ax.semilogy(time, d["PE_total"], label="PE", lw=1)
+    ax.semilogy(time, d["E_total"], label="E total", lw=1.2, color="k")
+    ax.set_xlabel("time"); ax.set_ylabel("energy (log)"); ax.set_title("Energies")
     ax.legend()
-    savefig(fig, outdir, "03_energies.png", args.dpi, saved)
+    save(fig, "03_energies.png")
 
     # 4. Zero-mode / deformation energy ratio vs time.
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -101,7 +131,7 @@ def main():
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel("time"); ax.set_ylabel("fraction"); ax.set_title("Rigid-body KE fraction")
     ax.legend()
-    savefig(fig, outdir, "04_zero_mode_KE_ratio.png", args.dpi, saved)
+    save(fig, "04_zero_mode_KE_ratio.png")
 
     # 5. Caster zero-mode fractions vs time.
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -112,7 +142,7 @@ def main():
     ax.set_xlabel("time"); ax.set_ylabel("fraction")
     ax.set_title("Caster-angle energy in zero modes")
     ax.legend()
-    savefig(fig, outdir, "05_caster_zero_fractions.png", args.dpi, saved)
+    save(fig, "05_caster_zero_fractions.png")
 
     # 6. Orientation order parameter.
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -122,7 +152,7 @@ def main():
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel("time"); ax.set_ylabel(r"$\Psi$")
     ax.set_title(f"Orientation order parameter ({kind}), mean {np.nanmean(op):.3f}")
-    savefig(fig, outdir, "06_order_parameter.png", args.dpi, saved)
+    save(fig, "06_order_parameter.png")
 
     # 7. Eigenvalue spectrum + time-averaged modal KE.
     evals = d["eigenvalues"]
@@ -137,7 +167,7 @@ def main():
     axes[1].bar(range(len(mean_modal_KE)), mean_modal_KE, color=colors)
     axes[1].set_xlabel("mode index"); axes[1].set_ylabel("time-avg modal KE")
     axes[1].set_title("Mean kinetic energy per mode")
-    savefig(fig, outdir, "07_mode_spectrum.png", args.dpi, saved)
+    save(fig, "07_mode_spectrum.png")
 
     # 8. Deformation mode shapes (quiver on reference lattice).
     ref = d["ref"]
@@ -161,7 +191,7 @@ def main():
             ax.set_title(f"mode {mi}, $\\lambda$={evals[mi]:.3g}")
             ax.set_xticks([]); ax.set_yticks([])
         fig.suptitle("Deformation mode shapes")
-        savefig(fig, outdir, "08_mode_shapes.png", args.dpi, saved)
+        save(fig, "08_mode_shapes.png")
 
     # 9. Caster-angle MSD with diffusion fit.
     lags = d["ang_msd_lags"]
@@ -176,7 +206,7 @@ def main():
     ax.set_xlabel("lag time"); ax.set_ylabel(r"$\langle \Delta\theta^2\rangle$")
     ax.set_title("Caster-angle MSD (per node + mean)")
     ax.legend()
-    savefig(fig, outdir, "09_caster_msd.png", args.dpi, saved)
+    save(fig, "09_caster_msd.png")
 
     # 10. PSDs.
     f = d["psd_freq"]
@@ -196,7 +226,7 @@ def main():
     axes[2].set_xlabel("frequency"); axes[2].set_ylabel("mode index")
     axes[2].set_title("Modal-energy PSD (log10)")
     fig.colorbar(im, ax=axes[2], label=r"$\log_{10}$ PSD")
-    savefig(fig, outdir, "10_psds.png", args.dpi, saved)
+    save(fig, "10_psds.png")
 
     # ------------------------------------------------------------------ #
     # Active-solid diagnostics
@@ -224,7 +254,7 @@ def main():
     axes[2].plot(time, d["spectral_entropy"], lw=1, color="C4",
                  label=fr"entropy (mean {np.nanmean(d['spectral_entropy']):.2f})")
     axes[2].set_xlabel("time"); axes[2].set_title("Mode condensation"); axes[2].legend()
-    savefig(fig, outdir, "11_collective_actuation.png", args.dpi, saved)
+    save(fig, "11_collective_actuation.png")
 
     # 12. Phase portraits: dominant pair and the first two non-zero modes.
     dom = d["dominant_modes"]
@@ -244,7 +274,7 @@ def main():
         ax.set_ylabel(f"mode {ib} amplitude")
         ax.set_title(f"Phase portrait ({lab})")
         fig.colorbar(lc, ax=ax, label="time")
-    savefig(fig, outdir, "12_phase_portraits.png", args.dpi, saved)
+    save(fig, "12_phase_portraits.png")
 
     # 13. Equipartition / per-mode effective temperature.
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -254,7 +284,7 @@ def main():
     ax.set_xlabel("mode index"); ax.set_ylabel("effective temperature")
     ax.set_title("Per-mode effective temperature (flat = equipartition)")
     ax.legend()
-    savefig(fig, outdir, "13_equipartition.png", args.dpi, saved)
+    save(fig, "13_equipartition.png")
 
     # 14. Chirality: body angular velocity and net polarization angle.
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -267,7 +297,7 @@ def main():
     axes[1].set_xlabel("time"); axes[1].set_ylabel("net polarization angle (unwrapped)")
     axes[1].set_title(fr"Polarization rotation (rate {float(d['pol_rot_rate']):.3g}, "
                       fr"orbit chirality {float(d['orbit_chirality']):.3g})")
-    savefig(fig, outdir, "14_chirality.png", args.dpi, saved)
+    save(fig, "14_chirality.png")
 
     # 15. Orientational autocorrelation and VACF.
     ct = d["corr_time"]
@@ -275,14 +305,15 @@ def main():
     axes[0].plot(ct, d["orient_acf"], lw=1.2)
     axes[0].axhline(1 / np.e, color="gray", ls=":", label="1/e")
     axes[0].axvline(float(d["tau_persist"]), color="C3", ls="--",
-                    label=fr"$\tau$={float(d['tau_persist']):.3g}")
+                    label=fr"$\tau_{{int}}$={float(d['tau_persist']):.3g}")
+    axes[0].axhline(0, color="gray", lw=0.6)
     axes[0].set_xlabel("lag time"); axes[0].set_ylabel(r"$\langle\cos\Delta\theta\rangle$")
-    axes[0].set_title("Orientational autocorrelation"); axes[0].legend()
+    axes[0].set_title("Orientational autocorrelation (integral corr. time)"); axes[0].legend()
     axes[1].plot(ct, d["vacf"], lw=1.2, color="C1")
     axes[1].axhline(0, color="gray", lw=0.6)
     axes[1].set_xlabel("lag time"); axes[1].set_ylabel("VACF")
     axes[1].set_title("Velocity autocorrelation")
-    savefig(fig, outdir, "15_autocorrelations.png", args.dpi, saved)
+    save(fig, "15_autocorrelations.png")
 
     # 16. Net active force vs CoM velocity.
     af, vc = d["active_force"], d["v_com"]
@@ -298,7 +329,7 @@ def main():
     axes[1].set_xlabel(r"$|F_{active}|$"); axes[1].set_ylabel(r"$|v_{cm}|$")
     axes[1].set_title("Active force vs CoM speed")
     fig.colorbar(sc, ax=axes[1], label="time")
-    savefig(fig, outdir, "16_active_force.png", args.dpi, saved)
+    save(fig, "16_active_force.png")
 
     # 17. Spatial polarity structure: bond alignment and ring winding.
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -313,7 +344,42 @@ def main():
         axes[1].text(0.5, 0.5, "winding N/A\n(non-ring topology)", ha="center", va="center")
         axes[1].set_title("Ring winding number")
     axes[1].set_xlabel("time"); axes[1].set_ylabel("winding")
-    savefig(fig, outdir, "17_spatial_polarity.png", args.dpi, saved)
+    save(fig, "17_spatial_polarity.png")
+
+    # 18. Per-node angular-velocity PSD (one curve per node).
+    if "node_omega_psd" in d.files:
+        f = d["psd_freq"]
+        nop = d["node_omega_psd"]   # (N, nf)
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for i in range(nop.shape[0]):
+            ax.semilogy(f, nop[i], lw=1, label=f"node {int(nodes[i])}")
+        ax.set_xlabel("frequency (Hz)"); ax.set_ylabel("PSD")
+        ax.set_title("Per-node angular-velocity PSD")
+        ax.legend(ncol=2, fontsize=8)
+        save(fig, "18_node_angular_velocity_psd.png")
+
+    # 19-20. Pairwise correlation heatmaps (node velocity, node heading angular velocity).
+    def corr_heatmap(mat, title, name):
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(mat, cmap="coolwarm", vmin=-1, vmax=1)
+        ax.set_xticks(range(len(nodes))); ax.set_yticks(range(len(nodes)))
+        ax.set_xticklabels([int(n) for n in nodes]); ax.set_yticklabels([int(n) for n in nodes])
+        ax.set_xlabel("node"); ax.set_ylabel("node"); ax.set_title(title)
+        for i in range(len(nodes)):
+            for j in range(len(nodes)):
+                v = mat[i, j]
+                if np.isfinite(v):
+                    ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=7,
+                            color="black" if abs(v) < 0.6 else "white")
+        fig.colorbar(im, ax=ax, label="correlation")
+        save(fig, name)
+
+    if "vel_corr" in d.files:
+        corr_heatmap(d["vel_corr"], "Pairwise node velocity correlation",
+                     "19_velocity_correlation.png")
+    if "omega_corr" in d.files:
+        corr_heatmap(d["omega_corr"], "Pairwise heading angular-velocity correlation",
+                     "20_angular_velocity_correlation.png")
 
     print(f"\nWrote {len(saved)} figures to {outdir}/")
 

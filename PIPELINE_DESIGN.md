@@ -57,7 +57,13 @@ coefficients for the tracker, plus QC artifacts.
   verification that corners were found correctly).
 - **Reporting**: overall RMS and per-image reprojection error, with a threshold flag to
   identify bad frames to drop.
-- Optional `--fisheye` model retained from the notebook for very wide lenses.
+- **Fisheye is the default model** (this project uses a wide-angle lens). The pinhole/rational
+  model cannot fit strong barrel distortion — symptoms are a stuck RMS (2–3 px) and an unstable
+  focal length. `--pinhole` switches to the rectilinear model (with `--fix-aspect-ratio` /
+  `--simple-distortion` sub-options). The saved calibration records `model` (fisheye|pinhole),
+  which the tracker reads to choose the correct un-distortion.
+- Guardrails: warns on resolution mismatch downstream, anisotropic `fx/fy` (pinhole only), and
+  RMS > 1 px. Per-image error is reported as true per-point RMS (`norm/√N`).
 
 **Assumptions**
 - All images share one resolution (asserted); the board's inner-corner count (`--pattern`,
@@ -91,7 +97,11 @@ data. No interpolation or reformatting (that is script 3's job).
 
 - **Pose (`x, y, z`)**: `solvePnP(SOLVEPNP_IPPE_SQUARE)` on the four tag corners with the
   correct object-point square. Object points are ordered top-left, top-right, bottom-right,
-  bottom-left to match `pupil_apriltags`' corner ordering.
+  bottom-left to match `pupil_apriltags`' corner ordering. The tracker reads the calibration
+  `model`: for **fisheye** it first maps the tag corners through `cv2.fisheye.undistortPoints`
+  (into pinhole-`K` pixels) and solves with `K` and no further distortion; for **pinhole** it
+  passes `dist_coeffs` to `solvePnP` directly. Using the pinhole path on a fisheye lens gives
+  garbage poses (this project's lens is fisheye).
 - **Caster angle (`angle`)** — **corrected from the original code.** The in-plane rotation is
   `theta = atan2(R[1,0], R[0,0])` where `R, _ = cv2.Rodrigues(rvec)`. The original script used
   `atan2(rvec[1], rvec[0])`, which is the direction of the Rodrigues **axis**, not the in-plane
@@ -156,12 +166,49 @@ interpolate gaps, transform into the lab frame, compute centroid and body angle.
 - **Per-node `_theta`** = lab-frame caster angle; **per-node `_angle`** = body-relative
   (`wrap(theta − body_angle)`).
 
+### Optional micro-controller sensor merge (`--sensor-csv`)
+
+Some experiments also stream a sensor CSV (`timestamp_s, timestamp_us, node_id,
+encoder_value, angle_value, motor_command`). When provided, it supplies the heading; when
+absent, the pipeline behaves exactly as above (both datasets supported; the output schema is
+a superset, so scripts 4–5 need no changes).
+
+- **Different mounting when sensor is present.** In these experiments the AprilTag is fixed to
+  the node **body**, not the caster. So the tag angle measures the node-base/body orientation
+  (and is *not* expected to match the caster). The magnetic-encoder `angle_value` **is** the
+  caster heading in the body frame directly. Confirmed empirically: sensor vs tag caster-angle
+  velocity correlation ≈ 0, and the tag in-plane angle jitters ~9°/frame (solvePnP's
+  worst-constrained DOF on a small `tag16h5` marker) — which is exactly why the sensor is used.
+- **Heading mapping**: `{n}_angle` (body) = raw sensor `angle_value`; `{n}_theta` (lab) =
+  `body_angle + sensor_angle`. No tag alignment (the tag isn't the caster). The hardware zero
+  was set at a roughly aligned orientation (noisy); cross-node angle statistics inherit that
+  per-node zero noise. `--sensor-angle-units {rad,deg}` (default rad); the raw range is logged
+  so the units can be verified.
+- **Clock & sync**: ESP-NOW broadcasts a shared epoch at start, so all nodes share one clock;
+  each node is interpolated onto the video frame grid. A single additive offset pins the
+  globally earliest `motor_command != 0` to the first video-motion frame (any-node speed over
+  an auto noise-floor threshold; `--motion-onset-frame` / `--motion-threshold` override).
+  Validated on real data: motor-on at frame 401 vs motion detected at 402, cross-correlation
+  peak at ~0 lag.
+- **Pre-sync/glitch rows** (a node's local uptime before the epoch broadcast → tiny
+  `timestamp_s`) are dropped (`timestamp_s < 1e9` when an epoch clock is present).
+- **Coverage**: heading is sensor-only — NaN outside the synced sensor window or for a node
+  absent from the sensor file (logged). `encoder_value` and `motor_command` are carried through
+  as extra `{n}_encoder` / `{n}_motor` columns.
+- **Metadata**: `heading_source` (sensor|tag), and when sensor is used `tag_mount=body`,
+  `sensor_sync_offset_s`, `motion_onset_frame`, `motor_onset_time_s`, `sensor_nodes`,
+  `sensor_angle_units`. `analyze_modes.py` zeros any all-NaN heading column (with a warning)
+  so the linear algebra doesn't propagate NaN.
+
 **Assumptions**
 - Exactly 4 corner tags define the arena; ring node ids are arranged in ascending order around
   the polygon (else the template is wrong — a non-hub-and-spoke topology falls back to the
   time-averaged mean shape with a warning).
 - Linear interpolation is acceptable for the observed gap sizes; large gaps are surfaced in the
   log rather than silently trusted.
+- Sensor experiments: tag body-fixed (heading from encoder); node bases share the body rotation
+  (`body_angle`) for the lab-frame reconstruction. The robot is at rest before actuation so the
+  motor-onset ↔ first-motion sync anchor is valid.
 
 ---
 
@@ -309,6 +356,13 @@ calculations** — it only visualizes stored quantities.
 - Rigid modes highlighted in a distinct color in the spectral/actuation bar charts.
 - Degenerate/near-degenerate deformation-mode structure is visible in the mode-shape quiver
   panel — a correctness signal (e.g. the hexagon's degenerate pair).
+- **Provenance stamping.** The plotter reads `heading_source` (sensor|tag) and `angle_frame`
+  (lab|body) from the `.npz` (`analyze_modes.py` stores both). Every figure gets a monospace
+  footer `heading source: … | angle frame: …`, and every filename is suffixed
+  `__<heading_source>_<angle_frame>` (e.g. `06_order_parameter__sensor_body.png`). This means
+  lab- and body-frame runs land in distinct files even in the same output directory and can
+  never be visually confused. Older bundles lacking the fields render as `?` — re-run
+  `analyze_modes.py` to repopulate them.
 
 **Figures**
 1. CoM trajectory (time-colored)  2. CoM 2D PDF  3. Energies (KE/PE/E)  4. Rigid-body KE
@@ -318,7 +372,141 @@ diffusion fit  10. PSDs (order parameter, KE/PE, modal-energy heatmap)  11. Coll
 actuation (coupling, actuation spectrum, condensation)  12. Phase portraits (dominant pair +
 first two non-zero modes)  13. Per-mode effective temperature  14. Chirality (ω + polarization
 angle)  15. Orientational ACF + VACF  16. Active force vs CoM velocity  17. Spatial polarity
-(bond alignment + winding).
+(bond alignment + winding)  18. Per-node angular-velocity PSD (7 curves)  19. Pairwise node
+velocity correlation heatmap  20. Pairwise heading angular-velocity correlation heatmap.
+
+---
+
+# Running the pipeline
+
+Environment: `/opt/miniconda3/envs/tplax_env/bin/python` (cv2 4.10, pupil_apriltags, scipy).
+Worked example: `240226_med_low_1` (has a sensor CSV).
+
+```bash
+PY=/opt/miniconda3/envs/tplax_env/bin/python
+cd /Users/alexleffell/Documents/PhD/tplax/tplax_robot_scripts
+
+# 1. Calibration (once per camera setup)
+$PY camera_calibration.py ../Data/temp_room_calibration/ --pattern 7 10 --glob '*.bmp' --square-size 1.0
+#   -> calibration.npz (+ .json, overlays/)
+
+# 2. Tracker (per video)  [--output-video for QC overlay, --subpix for corner refinement]
+$PY apriltag_tracker.py ../Data/240226/240226_med_low_1.mp4 \
+    --calib ../Data/temp_room_calibration/calibration.npz
+#   -> ..._raw.csv
+
+# 3. Format  (add --sensor-csv when the micro-controller file exists)
+$PY format_tracks.py ../Data/240226/240226_med_low_1_raw.csv --baseline 0.1689 \
+    --sensor-csv ../Data/240226/240226_med_low_1.csv
+#   -> ..._robot.csv (+ ..._robot.log)
+
+# 4. Analyze  (--angle-frame body when the sensor provides the heading; lab otherwise)
+$PY analyze_modes.py ../Data/240226/240226_med_low_1_robot.csv --k 1.0 --l0 0.1689 --angle-frame body
+#   -> ..._analysis.npz (+ ..._analysis.txt); modes cached in /Users/.../tplax_paper
+
+# 5. Plot
+$PY plot_analysis.py ../Data/240226/240226_med_low_1_analysis.npz
+#   -> ..._analysis_plots/*.png  (footer-stamped + filename-tagged with heading/frame)
+```
+
+Per-experiment knobs to remember:
+- **`--baseline`** (steps 3–4): node-to-node rest distance (m); sets the reference lattice.
+- **`--k` / `--l0`** (step 4): spring constant / rest length. Omit `--l0` for a relaxed lattice
+  (no pre-tension; exact zero rotation mode).
+- **`--angle-frame body`** (step 4): use whenever the sensor is the heading source (tag body-fixed).
+- **`--sensor-angle-units`** (step 3): default `rad` (correct for the observed [0, 2π] range).
+- **`--camera-frame`** (step 3): skip the lab transform if corner tags are unusable.
+- Tag family/sizes (step 2) default to `tag16h5` / 0.045 m / 0.037 m — override per dataset.
+
+Steps 3→4→5 are re-run while iterating on analysis; steps 1–2 are done once per camera/video.
+
+---
+
+# Command-line argument reference
+
+Every argument of every script (also available via `python <script>.py --help`). Positional
+arguments are required; all `--flags` are optional with the defaults shown.
+
+## `camera_calibration.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `image_dir` (positional) | — | Directory containing the calibration images. |
+| `--pattern COLS ROWS` | `7 10` | Number of **inner** checkerboard corners. |
+| `--square-size` | `1.0` | Physical square edge length; scales extrinsics only (intrinsics used downstream are unaffected). |
+| `--glob` | `*.bmp` | Filename glob within `image_dir`. |
+| `--output` | `<image_dir>/calibration.npz` | Output `.npz` path (a sibling `.json` is also written). |
+| `--overlay-dir` | `<image_dir>/overlays/` | Where corner-overlay QC images are written. |
+| `--pinhole` | off (default = fisheye) | Use the rectilinear pinhole model instead of the default fisheye model. |
+| `--fix-aspect-ratio` | off | (pinhole only) Force `fx == fy`. |
+| `--simple-distortion` | off | (pinhole only) Standard 5-coeff distortion instead of the rational 8-coeff model. |
+| `--error-threshold` | `1.0` | Per-image reprojection error (px) above which a warning is logged. |
+
+## `apriltag_tracker.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `video_path` (positional) | — | Input video file. |
+| `--calib` | built-in defaults (+warning) | Calibration `.npz` from `camera_calibration.py`. |
+| `--families` | `tag16h5` | AprilTag family (e.g. `tag36h11`); must match the printed tags. |
+| `--tag-size` | `0.045` | Node tag edge length (m). |
+| `--corner-tag-size` | `0.037` | Corner/environment tag edge length (m). |
+| `--corner-ids` | `26 27 28 29` | Tag ids treated as environment corner tags. |
+| `--valid-tags` | `0..13 + 26..29` | Tag ids to keep (all others discarded). |
+| `--nthreads` | `4` | Detector threads. |
+| `--quad-decimate` | `1.0` | Detector downsampling; raise to speed up, keep at 1 for `tag36h11`. |
+| `--quad-sigma` | `0.0` | Gaussian blur applied before detection. |
+| `--subpix` | off | Refine tag corners with `cv2.cornerSubPix` before `solvePnP`. |
+| `--hamming-max` | `0` | Max allowed decode Hamming distance (kept if `hamming <=` this). |
+| `--decision-margin-min` | `1.0` | Minimum decision margin to keep a detection. |
+| `--output` | `<video>_raw.csv` | Output raw CSV path. |
+| `--output-video` | off | Also write an undistorted, tag-annotated QC video. |
+| `--undistort-alpha` | `1.0` | Output-video undistort alpha: `1` keeps the full frame (black borders), `0` crops/zooms the distorted periphery. |
+
+## `format_tracks.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `raw_csv` (positional) | — | Raw CSV from `apriltag_tracker.py`. |
+| `--connections` | hub-and-spoke over `0..6` | Python-literal list of `(i, j)` node connections; defines the node set and template. |
+| `--corner-ids` | raw-CSV header, else `26 27 28 29` | Corner tag ids used to build the lab frame. |
+| `--arena-size W H` | observed corner spacing | Real lab-rectangle dimensions for the lab transform. |
+| `--camera-frame` | off | Skip the corner-tag lab transform; keep camera-frame positions. |
+| `--sensor-csv` | none | Micro-controller CSV; if given, its (body-frame) `angle_value` supplies the heading and encoder/motor are carried through. |
+| `--sensor-angle-units` | `rad` | Units of the sensor `angle_value` column (`rad` or `deg`). |
+| `--motion-onset-frame` | auto | Manual video motion-onset frame for sensor sync (overrides auto-detection). |
+| `--motion-threshold` | auto | Manual speed threshold for motion-onset detection (overrides the auto noise floor). |
+| `--baseline` | derived from data | Node-to-node template radius (m); does **not** affect the fitted body angle. |
+| `--fps` | raw-CSV header, else 30 | Override the frame rate. |
+| `--output` | `<raw>_robot.csv` | Output wide CSV path. |
+| `--log` | `<raw>_robot.log` | Text log path (stats + warnings). |
+
+## `analyze_modes.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `robot_csv` (positional) | — | Formatted CSV from `format_tracks.py`. |
+| `--k` | `1.0` | Uniform spring constant. |
+| `--l0` | each bond's equilibrium length | Uniform spring rest length; omit for a relaxed network (no pre-tension). |
+| `--baseline` | CSV header, else derived | Template radius (m). |
+| `--angle-frame` | `lab` | Caster-angle frame for order parameter/projections/diffusion: `lab` uses `{n}_theta`, `body` uses `{n}_angle`. |
+| `--nematic` | off (polar) | Use nematic order parameter \|⟨e^{2iθ}⟩\| instead of polar. |
+| `--vel-smooth-window` | `0` (off) | Savitzky-Golay window (odd frames) for the velocity estimate; velocity = SG analytic derivative (deriv=1). `0` = plain central difference. Suppresses the finite-difference noise floor in KE. |
+| `--modes-dir` | `/Users/.../tplax_paper` | Shared normal-mode cache directory (keyed by lattice). |
+| `--recompute-modes` | off | Recompute and overwrite the cached modes for this lattice. |
+| `--bins` | `50` | Bins per axis for the CoM 2D histogram. |
+| `--zero-mode-tol` | `1e-6` | Eigenvalue tolerance for reporting how many modes are numerically zero. |
+| `--output` | `<robot>_analysis.npz` | Output analysis bundle. |
+| `--summary` | `<robot>_analysis.txt` | Output summary (params, sanity checks, scalars). |
+
+## `plot_analysis.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `analysis_npz` (positional) | — | `*_analysis.npz` from `analyze_modes.py`. |
+| `--outdir` | `<npz>_plots/` | Output directory for the figures. |
+| `--dpi` | `130` | Figure DPI. |
+| `--n-modes` | `4` | Number of deformation mode shapes to draw. |
 
 ---
 
@@ -336,4 +524,10 @@ angle)  15. Orientational ACF + VACF  16. Active force vs CoM velocity  17. Spat
 - **Total energy is not conserved** (active, dissipative system); treat `E_total` as an
   observable.
 - **Lab-frame vs body-frame caster analysis** materially changes diffusion and the modal angle
-  projections; the order parameter is invariant. Default is lab.
+  projections; the order parameter is invariant. Default is lab. Provenance (heading source +
+  angle frame) is stamped on every figure and into every plot filename so the two are never
+  confused.
+- **Sensor-present experiments use a body-fixed tag**, so the tag caster-angle is not the caster
+  heading and (correctly) does not correlate with the encoder; the encoder is the heading source
+  and per-node hardware zeros are "roughly aligned but noisy", so cross-node angle statistics
+  inherit that per-node zero noise.

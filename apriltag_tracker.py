@@ -68,15 +68,20 @@ def parse_args():
                    help="Output CSV path. Default: <video>_raw.csv")
     p.add_argument("--output-video", action="store_true",
                    help="Also write an undistorted, tag-annotated video.")
+    p.add_argument("--undistort-alpha", type=float, default=1.0,
+                   help="getOptimalNewCameraMatrix alpha for the output video: 1 keeps the full "
+                        "frame (black borders), 0 crops/zooms out the distorted periphery. Default: 1.0")
     return p.parse_args()
 
 
 def load_calibration(path):
     if path is None:
         print("WARNING: no --calib given; using built-in default intrinsics.")
-        return DEFAULT_CAMERA_MATRIX, DEFAULT_DIST_COEFFS, "builtin_default"
+        return DEFAULT_CAMERA_MATRIX, DEFAULT_DIST_COEFFS, "builtin_default", None, "pinhole"
     data = np.load(path)
-    return data["camera_matrix"], data["dist_coeffs"], os.path.abspath(path)
+    image_size = tuple(int(v) for v in data["image_size"]) if "image_size" in data.files else None
+    model = str(data["model"]) if "model" in data.files else "pinhole"
+    return data["camera_matrix"], data["dist_coeffs"], os.path.abspath(path), image_size, model
 
 
 def object_points(size):
@@ -104,7 +109,8 @@ def main():
     if not os.path.exists(args.video_path):
         raise SystemExit(f"Error: input video not found at {args.video_path}")
 
-    camera_matrix, dist_coeffs, calib_source = load_calibration(args.calib)
+    camera_matrix, dist_coeffs, calib_source, calib_image_size, calib_model = load_calibration(args.calib)
+    print(f"Calibration model: {calib_model}")
     core_path = os.path.splitext(args.video_path)[0]
     output_csv = args.output or (core_path + "_raw.csv")
     output_video = (core_path + "_tagged.mp4") if args.output_video else None
@@ -130,6 +136,27 @@ def main():
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Video loaded: {total_frames} frames, {frame_width}x{frame_height}, {fps} FPS")
+
+    # Guardrail: anisotropic focal lengths indicate a degenerate pinhole calibration
+    # (fisheye fx~fy by construction, so this only applies to the pinhole model).
+    fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
+    if calib_model == "pinhole" and abs(fx / fy - 1.0) > 0.10:
+        print("\n" + "!" * 70)
+        print(f"WARNING: calibration fx/fy = {fx / fy:.2f} (fx={fx:.0f}, fy={fy:.0f}) -- not ~1.")
+        print("This is a DEGENERATE calibration (likely coplanar/fronto-parallel checkerboard "
+              "views); it anisotropically stretches recovered positions (e.g. x compressed by "
+              "~fx/fy). Re-calibrate with tilted board views. Positions here are unreliable.")
+        print("!" * 70 + "\n")
+
+    # Guardrail: the calibration must match the video resolution, or every pose is wrong.
+    if calib_image_size is not None and tuple(calib_image_size) != (frame_width, frame_height):
+        print("\n" + "!" * 70)
+        print(f"WARNING: calibration resolution {calib_image_size[0]}x{calib_image_size[1]} "
+              f"!= video resolution {frame_width}x{frame_height}.")
+        print("The intrinsics (focal length, principal point) will be WRONG for this video, "
+              "so all tag POSES/POSITIONS will be garbage (huge reprojection error, bad depth).")
+        print("Re-calibrate at the exact capture resolution/mode used for these videos.")
+        print("!" * 70 + "\n")
 
     out = None
     if output_video:
@@ -164,14 +191,21 @@ def main():
                 img_points = refined.reshape(-1, 2)
 
             obj_points = obj_corner if r.tag_id in corner_ids else obj_node
+            if calib_model == "fisheye":
+                # Undistort corners through the fisheye model into pinhole-K pixels,
+                # then solve with K and no further distortion.
+                und = cv2.fisheye.undistortPoints(
+                    img_points.reshape(-1, 1, 2), camera_matrix, dist_coeffs, P=camera_matrix)
+                pnp_pts, pnp_dist = und.reshape(-1, 2), None
+            else:
+                pnp_pts, pnp_dist = img_points, dist_coeffs
             success, rvec, tvec = cv2.solvePnP(
-                obj_points, img_points, camera_matrix, dist_coeffs,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                obj_points, pnp_pts, camera_matrix, pnp_dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
             if not success:
                 continue
 
-            proj, _ = cv2.projectPoints(obj_points, rvec, tvec, camera_matrix, dist_coeffs)
-            reproj_err = float(cv2.norm(img_points, proj.reshape(-1, 2), cv2.NORM_L2) / len(obj_points))
+            proj, _ = cv2.projectPoints(obj_points, rvec, tvec, camera_matrix, pnp_dist)
+            reproj_err = float(cv2.norm(pnp_pts, proj.reshape(-1, 2), cv2.NORM_L2) / np.sqrt(len(obj_points)))
 
             results.append({
                 "frame#": frame_count,
@@ -195,9 +229,14 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
         if out is not None:
-            h, w = image.shape[:2]
-            new_cm, _ = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w, h), 0, (w, h))
-            undist = cv2.undistort(image, camera_matrix, dist_coeffs, None, new_cm)
+            if calib_model == "fisheye":
+                undist = cv2.fisheye.undistortImage(image, camera_matrix, dist_coeffs,
+                                                    Knew=camera_matrix)
+            else:
+                h, w = image.shape[:2]
+                new_cm, _ = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w, h),
+                                                          args.undistort_alpha, (w, h))
+                undist = cv2.undistort(image, camera_matrix, dist_coeffs, None, new_cm)
             flip = cv2.flip(undist, 0)
             out.write(cv2.cvtColor(flip, cv2.COLOR_GRAY2BGR))
 
@@ -214,6 +253,18 @@ def main():
         "frame#", "node_id", "x", "y", "z", "angle",
         "hamming", "decision_margin", "reproj_err"])
 
+    # Guardrail: a healthy planar-tag pose reprojects to ~1 px. A large median error means
+    # the pose is unreliable (usually a calibration/resolution mismatch or wrong tag size).
+    if len(df):
+        med_reproj = float(df["reproj_err"].median())
+        print(f"Median reprojection error: {med_reproj:.2f} px")
+        if med_reproj > 5.0:
+            print("!" * 70)
+            print(f"WARNING: median reprojection error {med_reproj:.1f} px is very high — tag "
+                  "POSITIONS are unreliable. Check calibration matches the video resolution, "
+                  "and that --tag-size matches the printed tags.")
+            print("!" * 70)
+
     metadata = {
         "fps": fps,
         "total_frames": total_frames,
@@ -224,6 +275,7 @@ def main():
         "corner_tag_size": args.corner_tag_size,
         "corner_ids": list(args.corner_ids),
         "calib_source": calib_source,
+        "calib_model": calib_model,
     }
     with open(output_csv, "w") as f:
         for key, value in metadata.items():

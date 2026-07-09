@@ -41,7 +41,7 @@ from io import StringIO
 
 import numpy as np
 import pandas as pd
-from scipy.signal import welch
+from scipy.signal import welch, savgol_filter
 
 DEFAULT_MODES_DIR = "/Users/alexleffell/Documents/PhD/tplax/tplax_paper"
 
@@ -242,12 +242,16 @@ def angular_msd_diffusion(theta_t, dt, max_lag_frac=0.25, fit_frac=0.5):
 
 
 def persistence_time(acf, dt):
-    """Rough correlation time: first 1/e crossing of an autocorrelation, else its integral."""
-    below = np.where(acf < 1.0 / np.e)[0]
-    if len(below):
-        return float(below[0] * dt)
+    """Integral correlation time: integral of C(tau) from 0 to its first zero crossing.
+
+    Far more stable than a 1/e-crossing threshold, which is fragile when C(tau) hovers
+    near 1/e (it can jump by many seconds for tiny changes in the curve)."""
+    zc = np.where(acf < 0)[0]
+    end = int(zc[0]) if len(zc) else len(acf)
+    if end < 2:
+        return 0.0
     trapezoid = getattr(np, "trapezoid", np.trapz)   # np.trapz deprecated in NumPy 2.0
-    return float(trapezoid(acf, dx=dt))
+    return float(trapezoid(acf[:end], dx=dt))
 
 
 def hub_and_ring(nodes, connections):
@@ -285,6 +289,10 @@ def parse_args():
                    help=f"Directory for the shared normal-mode cache. Default: {DEFAULT_MODES_DIR}")
     p.add_argument("--recompute-modes", action="store_true",
                    help="Recompute and overwrite cached normal modes for this lattice.")
+    p.add_argument("--vel-smooth-window", type=int, default=0,
+                   help="Savitzky-Golay window (frames, odd) for the velocity estimate: velocity is "
+                        "the SG analytic derivative (deriv=1) over this window. 0 = off (plain "
+                        "central difference). Reduces the noise floor that inflates deformation KE.")
     p.add_argument("--bins", type=int, default=50, help="Bins per axis for the CoM 2D histogram. Default: 50")
     p.add_argument("--zero-mode-tol", type=float, default=1e-6,
                    help="Eigenvalue tolerance for reporting how many modes are numerically zero.")
@@ -335,13 +343,33 @@ def main():
     Y = np.stack([col(f"{n}_y") for n in nodes], axis=1)
     angle_col = "theta" if args.angle_frame == "lab" else "angle"
     TH = np.stack([col(f"{n}_{angle_col}") for n in nodes], axis=1)
-    log(f"Caster-angle frame: {args.angle_frame} (column {{n}}_{angle_col})")
+    log(f"Caster-angle frame: {args.angle_frame} (column {{n}}_{angle_col}); "
+        f"heading source: {meta.get('heading_source', 'tag')}")
+    # A node with no heading at all (e.g. absent from a sensor-only run) is all-NaN after
+    # interpolation; zero it so the linear-algebra steps don't propagate NaN, and warn.
+    allnan = [nodes[j] for j in range(N) if not np.isfinite(TH[:, j]).any()]
+    if allnan:
+        log(f"WARNING: no heading for node(s) {allnan}; their angle set to 0 for the analysis.")
+        TH = np.nan_to_num(TH, nan=0.0)
     pos = np.stack([X, Y], axis=-1)                        # (T, N, 2)
 
     com = np.stack([df["centroid_x"].to_numpy(), df["centroid_y"].to_numpy()], axis=-1)
 
-    # Velocities (finite difference), unit mass.
-    vel = np.gradient(pos, dt, axis=0)                     # (T, N, 2)
+    # Velocities, unit mass. With --vel-smooth-window, use a Savitzky-Golay analytic
+    # derivative (fit a local polynomial, evaluate its derivative) -- the standard smooth
+    # differentiator for noisy uniformly-sampled data; it suppresses the per-frame
+    # tracking-noise floor that otherwise inflates deformation KE at low speed. Otherwise
+    # fall back to a plain 2nd-order central difference (np.gradient).
+    if args.vel_smooth_window and args.vel_smooth_window > 1 and T >= 5:
+        w = int(args.vel_smooth_window)
+        if w % 2 == 0:
+            w += 1
+        w = min(w, (T // 2) * 2 - 1)      # keep odd and < T
+        poly = min(3, w - 1)
+        vel = savgol_filter(pos, w, poly, deriv=1, delta=dt, axis=0)   # (T, N, 2)
+        log(f"Velocity: Savitzky-Golay derivative (window={w}, poly={poly}).")
+    else:
+        vel = np.gradient(pos, dt, axis=0)                 # 2nd-order central difference
     vel_def, v_cm, omega = remove_rigid(pos, vel)
 
     # --- Elastic normal modes ------------------------------------------- #
@@ -539,6 +567,36 @@ def main():
     _, psd_PE = psd(PE_total)
     modal_energy_psd = np.array([psd(modal_KE[:, i])[1] for i in range(2 * N)])  # (2N, nf)
 
+    # --- Per-node angular velocity: PSD + pairwise correlation ---------- #
+    # Angular velocity of each node's caster heading (in the selected angle frame).
+    node_omega = np.gradient(np.unwrap(TH, axis=0), dt, axis=0)          # (T, N)
+    node_omega_psd = np.array([psd(node_omega[:, i])[1] for i in range(N)])  # (N, nf)
+
+    # Pairwise node velocity correlation: time-mean normalized dot product of the
+    # (full) 2D node velocities. Cij in [-1, 1], diagonal 1.
+    vel_corr = np.full((N, N), np.nan)
+    for i in range(N):
+        for j in range(N):
+            vi, vj = vel[:, i, :], vel[:, j, :]
+            m = np.isfinite(vi).all(axis=1) & np.isfinite(vj).all(axis=1)
+            if m.sum() < 2:
+                continue
+            num = np.mean(np.sum(vi[m] * vj[m], axis=1))
+            di = np.mean(np.sum(vi[m] * vi[m], axis=1))
+            dj = np.mean(np.sum(vj[m] * vj[m], axis=1))
+            if di > 0 and dj > 0:
+                vel_corr[i, j] = num / np.sqrt(di * dj)
+
+    # Pairwise angular-velocity correlation between node headings (Pearson).
+    omega_corr = np.full((N, N), np.nan)
+    for i in range(N):
+        for j in range(N):
+            a, b = node_omega[:, i], node_omega[:, j]
+            m = np.isfinite(a) & np.isfinite(b)
+            if m.sum() < 2 or np.std(a[m]) == 0 or np.std(b[m]) == 0:
+                continue
+            omega_corr[i, j] = np.corrcoef(a[m], b[m])[0, 1]
+
     # --- Sanity checks -------------------------------------------------- #
     log("\n" + "=" * 64)
     log("Sanity checks (max abs residual over frames)")
@@ -587,7 +645,9 @@ def main():
     log(f"Mean body angular velocity <omega>      : {mean_omega:+.5e} +/- {std_omega:.3e}")
     log(f"Net polarization rotation rate          : {pol_rot_rate:+.5e}  [rad/time]")
     log(f"Dominant-pair orbit chirality (signed)  : {orbit_chirality:+.5e}")
-    log(f"Orientational persistence time tau      : {tau_persist:.4f}  [time]")
+    log(f"Orientational integral corr. time tau   : {tau_persist:.4f}  [time]")
+    log(f"Mean absolute internal (deformation) KE : {np.nanmean(KE_deform):.5e}")
+    log(f"Mean absolute rigid-body KE             : {np.nanmean(KE_zero):.5e}")
     log(f"Mean bond alignment <cos dtheta>        : {np.nanmean(bond_align):+.4f}")
     log(f"Mean ring winding number                : {np.nanmean(winding):+.4f}")
     log(f"Mean active-force / CoM-velocity align  : {mean_force_vel_alignment:+.4f}")
@@ -606,6 +666,7 @@ def main():
         modal_amp=A_def, modal_KE=modal_KE, modal_disp=Q,
         caster_lap_proj=B, caster_elastic_proj=C,
         angle_frame=args.angle_frame, modes_source=modes_source,
+        heading_source=str(meta.get("heading_source", "tag")),
         # active-solid diagnostics
         coupling_pv=coupling_pv, coupling_pvdef=coupling_pvdef,
         actuation_spectrum=actuation_spectrum, actuation_coproj=actuation_coproj,
@@ -632,6 +693,7 @@ def main():
         # PSDs
         psd_freq=psd_freq, psd_order=psd_order, psd_KE=psd_KE, psd_PE=psd_PE,
         modal_energy_psd=modal_energy_psd,
+        node_omega_psd=node_omega_psd, vel_corr=vel_corr, omega_corr=omega_corr,
         # params
         k=args.k, l0=(l0 if l0 is not None else np.nan), baseline=(baseline if baseline else np.nan),
     )

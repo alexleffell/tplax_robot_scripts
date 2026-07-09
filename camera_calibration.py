@@ -42,8 +42,15 @@ def parse_args():
                    help="Output .npz path. Default: <image_dir>/calibration.npz")
     p.add_argument("--overlay-dir", type=str, default=None,
                    help="Directory for corner-overlay images. Default: <image_dir>/overlays/")
-    p.add_argument("--fisheye", action="store_true",
-                   help="Also run the fisheye calibration model and report its result.")
+    p.add_argument("--pinhole", action="store_true",
+                   help="Calibrate with the standard PINHOLE model. Default is the FISHEYE model "
+                        "(this project's wide-angle lens); use --pinhole only for a rectilinear lens.")
+    p.add_argument("--fix-aspect-ratio", action="store_true",
+                   help="(pinhole only) Force fx == fy (square pixels). Better-conditioned when the "
+                        "board views don't cleanly constrain the aspect ratio.")
+    p.add_argument("--simple-distortion", action="store_true",
+                   help="(pinhole only) Use the standard 5-coefficient distortion model instead of "
+                        "the rational 8-coefficient model, which can overfit modest image sets.")
     p.add_argument("--error-threshold", type=float, default=1.0,
                    help="Per-image reprojection error (px) above which a warning is logged. Default: 1.0")
     return p.parse_args()
@@ -133,66 +140,81 @@ def main():
     print(f"\nCalibrating from {len(objpoints)} images "
           f"({len(failed_images)} skipped)...")
 
-    flags = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_FIX_K6
-    rms, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
-        objpoints, imgpoints, image_size, None, None, flags=flags)
-
-    # Per-image reprojection error.
-    print(f"\nOverall RMS reprojection error: {rms:.4f} px")
-    print("Per-image reprojection error:")
+    model = "pinhole" if args.pinhole else "fisheye"
+    print("Calibration model:", model)
     per_image_errors = []
-    for i, fname in enumerate(used_images):
-        proj, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i],
-                                    camera_matrix, dist_coeffs)
-        err = cv2.norm(imgpoints[i], proj, cv2.NORM_L2) / len(proj)
-        per_image_errors.append(err)
-        flag = "  <-- high" if err > args.error_threshold else ""
-        print(f"  {os.path.basename(fname):40s} {err:.4f} px{flag}")
-
-    print("\nCamera matrix:\n", camera_matrix)
-    print("\nDistortion coefficients:\n", dist_coeffs.ravel())
-
-    # Optional fisheye model.
-    fisheye_result = None
-    if args.fisheye:
+    if model == "fisheye":
+        # Wide-angle/fisheye lenses need the fisheye projection model; a pinhole/rational
+        # fit cannot capture the barrel distortion (inflated RMS, unstable focal length).
+        n_ok = len(objpoints)
+        camera_matrix = np.zeros((3, 3))
+        dist_coeffs = np.zeros((4, 1))
+        rvecs = [np.zeros((1, 1, 3)) for _ in range(n_ok)]
+        tvecs = [np.zeros((1, 1, 3)) for _ in range(n_ok)]
+        fe_obj = [op.reshape(1, -1, 3) for op in objpoints]
+        fe_img = [ip.reshape(1, -1, 2) for ip in imgpoints]
+        fe_flags = cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC | cv2.fisheye.CALIB_FIX_SKEW
         try:
-            n_ok = len(objpoints)
-            K = np.zeros((3, 3))
-            D = np.zeros((4, 1))
-            fe_rvecs = [np.zeros((1, 1, 3), dtype=np.float64) for _ in range(n_ok)]
-            fe_tvecs = [np.zeros((1, 1, 3), dtype=np.float64) for _ in range(n_ok)]
-            # fisheye.calibrate wants object points shaped (1, N, 3).
-            fe_obj = [op.reshape(1, -1, 3) for op in objpoints]
-            fe_img = [ip.reshape(1, -1, 2) for ip in imgpoints]
-            fe_flags = (cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
-                        + cv2.fisheye.CALIB_CHECK_COND
-                        + cv2.fisheye.CALIB_FIX_SKEW)
-            fe_rms, _, _, _, _ = cv2.fisheye.calibrate(
-                fe_obj, fe_img, image_size, K, D, fe_rvecs, fe_tvecs, fe_flags,
-                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6))
-            fisheye_result = {"rms": float(fe_rms), "K": K.tolist(), "D": D.tolist()}
-            print(f"\nFisheye RMS: {fe_rms:.4f} px")
-            print("Fisheye K:\n", K)
-            print("Fisheye D:\n", D.ravel())
+            rms, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.fisheye.calibrate(
+                fe_obj, fe_img, image_size, camera_matrix, dist_coeffs, rvecs, tvecs, fe_flags,
+                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-6))
         except cv2.error as e:
-            print(f"\nWARNING: fisheye calibration failed: {e}")
+            raise SystemExit(f"Fisheye calibration failed ({str(e)[:120]}). Try pruning blurry / "
+                             "extreme-angle frames, then re-run.")
+    else:
+        flags = 0 if args.simple_distortion else (cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_FIX_K6)
+        print("Distortion model:", "standard 5-coeff" if args.simple_distortion else "rational 8-coeff")
+        if args.fix_aspect_ratio:
+            flags |= cv2.CALIB_FIX_ASPECT_RATIO   # force fx == fy (square pixels)
+            print("Fixing aspect ratio (fx == fy).")
+        rms, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
+            objpoints, imgpoints, image_size, None, None, flags=flags)
+        # Per-image RMS reprojection error (per point, in px): norm / sqrt(n_points).
+        for i in range(len(used_images)):
+            proj, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
+            per_image_errors.append(cv2.norm(imgpoints[i], proj, cv2.NORM_L2) / np.sqrt(len(proj)))
+
+    print(f"\nOverall RMS reprojection error: {rms:.4f} px")
+    if per_image_errors:
+        print("Per-image RMS reprojection error:")
+        for fname, err in zip(used_images, per_image_errors):
+            flag = "  <-- high" if err > args.error_threshold else ""
+            print(f"  {os.path.basename(fname):40s} {err:.4f} px{flag}")
+    print("\nCamera matrix:\n", camera_matrix)
+    print("\nDistortion coefficients:\n", np.ravel(dist_coeffs))
+
+    # Guardrails. Aspect check only for pinhole (fisheye fx~fy by construction).
+    fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
+    if model == "pinhole" and abs(fx / fy - 1.0) > 0.10:
+        print("\n" + "!" * 70)
+        print(f"WARNING: fx/fy = {fx / fy:.2f} (fx={fx:.0f}, fy={fy:.0f}) is far from 1.0.")
+        print("Real cameras have ~square pixels. This is a DEGENERATE calibration (coplanar board")
+        print("views), OR the lens is wide-angle/fisheye -- if so, re-run with --fisheye.")
+        print("!" * 70)
+    if float(rms) > 1.0:
+        hint = ("Prune high-error frames; ensure the board is sharp and fills more of the frame."
+                if model == "fisheye" else
+                "Prune high-error frames (or, for a wide/fisheye lens, drop --pinhole).")
+        print(f"\nWARNING: overall RMS reprojection error {float(rms):.2f} px is high (want < ~0.5 px). "
+              + hint)
 
     # Save results.
-    save_kwargs = dict(
+    camera_matrix = np.asarray(camera_matrix)
+    dist_coeffs = np.asarray(dist_coeffs)
+    np.savez(
+        output,
         camera_matrix=camera_matrix,
         dist_coeffs=dist_coeffs,
         image_size=np.array(image_size),
-        rms=np.array(rms),
+        rms=np.array(float(rms)),
         pattern=np.array(pattern),
         square_size=np.array(args.square_size),
+        model=model,
     )
-    if fisheye_result is not None:
-        save_kwargs["fisheye_K"] = np.array(fisheye_result["K"])
-        save_kwargs["fisheye_D"] = np.array(fisheye_result["D"])
-    np.savez(output, **save_kwargs)
 
     json_path = os.path.splitext(output)[0] + ".json"
     json_blob = {
+        "model": model,
         "camera_matrix": camera_matrix.tolist(),
         "dist_coeffs": dist_coeffs.tolist(),
         "image_size": list(image_size),
@@ -204,8 +226,6 @@ def main():
         "per_image_errors": [float(e) for e in per_image_errors],
         "failed_images": [os.path.basename(f) for f in failed_images],
     }
-    if fisheye_result is not None:
-        json_blob["fisheye"] = fisheye_result
     with open(json_path, "w") as f:
         json.dump(json_blob, f, indent=2)
 

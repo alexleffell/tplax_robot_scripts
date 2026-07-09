@@ -217,14 +217,23 @@ def build_template(nodes, connections, baseline, xw, yw, log):
 
     r = baseline
     if r is None:
-        # Mean hub->ring distance over all frames.
+        # Mean hub->ring distance over all frames, using only detected nodes.
         dists = []
-        for n in ring:
-            dx = xw[n].values - xw[hub].values
-            dy = yw[n].values - yw[hub].values
-            dists.append(np.nanmean(np.sqrt(dx ** 2 + dy ** 2)))
-        r = float(np.nanmean(dists)) if dists else 1.0
-        log(f"Derived baseline (mean hub->ring distance): {r:.4f}")
+        if hub in xw.columns:
+            for n in ring:
+                if n in xw.columns:
+                    dx = xw[n].values - xw[hub].values
+                    dy = yw[n].values - yw[hub].values
+                    dists.append(np.nanmean(np.sqrt(dx ** 2 + dy ** 2)))
+        dists = [d for d in dists if np.isfinite(d)]
+        if dists:
+            r = float(np.nanmean(dists))
+            log(f"Derived baseline (mean hub->ring distance): {r:.4f}")
+        else:
+            r = 1.0
+            log("WARNING: cannot derive baseline (too few detected nodes); using r=1.0. "
+                "Pass --baseline for a meaningful template radius. (Radius does not affect "
+                "the fitted body angle.)")
 
     template = {hub: (0.0, 0.0)}
     m = len(ring)
@@ -237,11 +246,144 @@ def build_template(nodes, connections, baseline, xw, yw, log):
 
 
 def mean_shape_template(nodes, xw, yw):
-    return {n: (float(np.nanmean(xw[n].values)), float(np.nanmean(yw[n].values))) for n in nodes}
+    # Only include detected nodes; undetected ones have no column in the pivot.
+    return {n: (float(np.nanmean(xw[n].values)), float(np.nanmean(yw[n].values)))
+            for n in nodes if n in xw.columns}
 
 
 def wrap_angle(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def circ_mean(angles):
+    """Circular mean of a 1D array of angles (rad); NaN if empty."""
+    angles = np.asarray(angles, dtype=float)
+    angles = angles[np.isfinite(angles)]
+    if angles.size == 0:
+        return np.nan
+    return float(np.arctan2(np.mean(np.sin(angles)), np.mean(np.cos(angles))))
+
+
+# --------------------------------------------------------------------------- #
+# Micro-controller sensor merge (optional)
+# --------------------------------------------------------------------------- #
+def detect_motion_onset(xw, yw, nodes, fps, total_frames, threshold=None, min_run=3):
+    """First frame where ANY node's speed exceeds a threshold (auto from noise floor).
+
+    Returns (onset_frame, threshold, speed_series)."""
+    speeds = []
+    for n in nodes:
+        if n in xw.columns:
+            x, y = xw[n].values, yw[n].values
+            speeds.append(np.hypot(np.gradient(x), np.gradient(y)) * fps)
+    if not speeds:
+        return 0, 0.0, np.zeros(total_frames)
+    s = np.nan_to_num(np.nanmax(np.vstack(speeds), axis=0))
+    if threshold is None:
+        srt = np.sort(s)
+        base = np.median(srt[:max(1, int(0.2 * len(srt)))])       # quiet-period noise floor
+        mad = np.median(np.abs(s - base))
+        threshold = max(base + 6 * 1.4826 * mad, base * 3, 1e-9)
+    above = s > threshold
+    onset = 0
+    for i in range(len(above) - min_run + 1):
+        if np.all(above[i:i + min_run]):
+            onset = i
+            break
+    return onset, float(threshold), s
+
+
+def load_and_sync_sensor(path, nodes, total_frames, fps, xw, yw, body_angle, args, log):
+    """Load the micro-controller CSV, sync it to the video, and interpolate each node's
+    caster heading (body frame) onto the video frame grid. Returns a dict of per-node arrays
+    or None if the file has no actuation (cannot sync).
+
+    Geometry (sensor-present experiments): the AprilTag is fixed to the node BODY, not the
+    caster, so the tag angle is the node-base orientation and does NOT measure the caster.
+    The magnetic-encoder ``angle_value`` IS the caster heading in the body frame directly.
+    Hence the sensor angle is used raw (no tag alignment): body-frame heading = sensor angle
+    (up to the hardware zero, which was set at a roughly aligned orientation), and lab-frame
+    heading = body_angle + sensor angle.
+
+    Sync: video and sensor share a real-time clock (ESP-NOW broadcast). The globally
+    earliest motor_command != 0 is pinned to the first video-motion frame -> single offset.
+    Heading is sensor-only: NaN outside sensor coverage.
+    """
+    sdf = pd.read_csv(path)
+    required = {"timestamp_s", "timestamp_us", "node_id", "encoder_value",
+                "angle_value", "motor_command"}
+    missing = required - set(sdf.columns)
+    if missing:
+        raise SystemExit(f"Sensor CSV missing columns: {sorted(missing)}")
+    # Drop pre-sync / glitch rows: before the base-station epoch broadcast a node reports its
+    # local uptime (small timestamp_s), which would corrupt the shared-clock interpolation.
+    n_dropped = 0
+    if sdf["timestamp_s"].max() > 1e9:
+        bad = sdf["timestamp_s"] < 1e9
+        n_dropped = int(bad.sum())
+        if n_dropped:
+            sdf = sdf[~bad].copy()
+    sdf = sdf.assign(t=sdf["timestamp_s"].astype(float) + sdf["timestamp_us"].astype(float) * 1e-6)
+    ang_scale = np.pi / 180.0 if args.sensor_angle_units == "deg" else 1.0
+
+    log("\n=== Sensor merge ===")
+    log(f"Sensor CSV              : {path}  ({len(sdf)} rows, {n_dropped} pre-sync/glitch dropped)")
+    log(f"angle_value raw range   : [{sdf['angle_value'].min():.4g}, {sdf['angle_value'].max():.4g}] "
+        f"(units={args.sensor_angle_units}; check this looks right)")
+
+    nz = sdf[sdf["motor_command"] != 0]
+    if nz.empty:
+        log("WARNING: motor_command is never non-zero; cannot sync. Falling back to tag heading.")
+        return None
+    motor_onset = float(nz["t"].min())
+
+    if args.motion_onset_frame is not None:
+        onset_frame, thr = int(args.motion_onset_frame), None
+    else:
+        onset_frame, thr, _ = detect_motion_onset(xw, yw, nodes, fps, total_frames,
+                                                   args.motion_threshold)
+    offset = onset_frame / fps - motor_onset
+    log(f"Motor onset (sensor t)  : {motor_onset:.4f} s")
+    log(f"Video motion onset frame: {onset_frame}"
+        + (f" (auto, speed thr={thr:.4g})" if thr is not None else " (manual)"))
+    log(f"Sync offset (video-sensor): {offset:+.4f} s")
+
+    tf = np.arange(total_frames) / fps
+    out = {"theta_lab": {}, "angle_body": {}, "encoder": {}, "motor": {},
+           "offset": offset, "onset_frame": onset_frame, "motor_onset": motor_onset,
+           "threshold": thr, "sensor_nodes": [], "coverage": {}}
+
+    def interp_mask(tv, vals):
+        v = np.interp(tf, tv, vals)
+        v[(tf < tv.min()) | (tf > tv.max())] = np.nan
+        return v
+
+    for n in nodes:
+        sub = sdf[sdf["node_id"] == n].sort_values("t")
+        if len(sub) < 2:
+            continue
+        tv = sub["t"].values + offset
+        # Raw sensor angle is the body-frame caster heading (tag is body-fixed here, so
+        # there is no tag caster reference to align to).
+        ab = wrap_angle(interp_mask(tv, sub["angle_value"].values.astype(float) * ang_scale))
+        out["angle_body"][n] = ab
+        out["theta_lab"][n] = wrap_angle(body_angle + ab)   # lab = body orientation + caster
+        out["encoder"][n] = interp_mask(tv, sub["encoder_value"].values.astype(float))
+        out["motor"][n] = interp_mask(tv, sub["motor_command"].values.astype(float))
+        out["coverage"][n] = int(np.isfinite(ab).sum())
+        out["sensor_nodes"].append(n)
+
+    if not out["sensor_nodes"]:
+        log("WARNING: no usable per-node sensor data; falling back to tag heading.")
+        return None
+    log("Heading = raw sensor caster angle (tag is body-fixed; not used for the heading).")
+    log(f"Sensor nodes            : {out['sensor_nodes']}")
+    log(f"Per-node frame coverage : "
+        + ", ".join(f"{n}:{out['coverage'][n]}/{total_frames}" for n in out["sensor_nodes"]))
+    absent = [n for n in nodes if n not in out["sensor_nodes"]]
+    if absent:
+        log(f"WARNING: nodes with no sensor data (heading -> NaN, sensor-only): {absent}")
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +402,16 @@ def parse_args():
     p.add_argument("--camera-frame", action="store_true",
                    help="Skip the corner-tag lab-frame transform and keep all positions in the "
                         "camera frame. (Corner tags still appear as extra tags.)")
+    p.add_argument("--sensor-csv", type=str, default=None,
+                   help="Optional micro-controller CSV (timestamp_s, timestamp_us, node_id, "
+                        "encoder_value, angle_value, motor_command). If given, its (body-frame) "
+                        "angle_value is used for the heading and encoder/motor are carried through.")
+    p.add_argument("--sensor-angle-units", choices=["rad", "deg"], default="rad",
+                   help="Units of the sensor angle_value column. Default: rad.")
+    p.add_argument("--motion-onset-frame", type=int, default=None,
+                   help="Manual video motion-onset frame for sensor sync (overrides auto-detection).")
+    p.add_argument("--motion-threshold", type=float, default=None,
+                   help="Manual speed threshold for motion-onset detection (overrides auto noise floor).")
     p.add_argument("--baseline", type=float, default=None,
                    help="Node-to-node distance for the template. If omitted, derived from data. "
                         "(Only sets the template radius; does not affect the fitted body_angle.)")
@@ -356,39 +508,33 @@ def main():
     tmpl_nodes = [n for n in nodes if n in template]
     tmpl_pts = np.array([template[n] for n in tmpl_nodes])
 
-    # --- Per-frame assembly ----------------------------------------------- #
-    rows = []
-    prev_pts = None
-    prev_ids = None
-    incr_accum = 0.0
-    skipped_abs = 0
-    skipped_incr = 0
+    # --- Rigid-body fit (arrays: centroid, body angle) -------------------- #
+    centroid_x = np.full(total_frames, np.nan)
+    centroid_y = np.full(total_frames, np.nan)
+    body_angle = np.full(total_frames, np.nan)
+    body_angle_incr = np.full(total_frames, np.nan)
+    prev_pts, prev_ids, incr_accum = None, None, 0.0
+    skipped_abs = skipped_incr = 0
 
     for t in range(total_frames):
-        row = {"time": t / fps}
-
-        # Node positions available this frame (post-interpolation, non-NaN).
         node_pos = {}
         for n in nodes:
             if n in xw.columns:
                 x, y = xw.at[t, n], yw.at[t, n]
                 if np.isfinite(x) and np.isfinite(y):
                     node_pos[n] = (x, y)
+        if node_pos:
+            centroid_x[t] = np.mean([p[0] for p in node_pos.values()])
+            centroid_y[t] = np.mean([p[1] for p in node_pos.values()])
 
-        centroid_x = np.mean([p[0] for p in node_pos.values()]) if node_pos else np.nan
-        centroid_y = np.mean([p[1] for p in node_pos.values()]) if node_pos else np.nan
-
-        # Absolute body angle: Kabsch(template -> observed) over shared nodes.
         shared = [n for n in tmpl_nodes if n in node_pos]
         if len(shared) >= 2:
             A = np.array([template[n] for n in shared])
             B = np.array([node_pos[n] for n in shared])
-            body_angle = kabsch_angle(A, B)
+            body_angle[t] = kabsch_angle(A, B)
         else:
-            body_angle = np.nan
             skipped_abs += 1
 
-        # Incremental body angle: Kabsch(prev -> curr) over shared nodes, integrated.
         cur_ids = sorted(node_pos.keys())
         if prev_pts is not None:
             common = [n for n in cur_ids if n in prev_ids]
@@ -398,26 +544,49 @@ def main():
                 incr_accum += kabsch_angle(A, B)
             else:
                 skipped_incr += 1
-        body_angle_incremental = incr_accum
+        body_angle_incr[t] = incr_accum
         prev_pts, prev_ids = node_pos, set(cur_ids)
 
-        # Per-node columns.
-        for n in nodes:
-            if n in xw.columns:
-                row[f"{n}_x"] = xw.at[t, n]
-                row[f"{n}_y"] = yw.at[t, n]
-                row[f"{n}_z"] = zw.at[t, n] if n in zw.columns else np.nan
-                theta = aw.at[t, n] if n in aw.columns else np.nan
-                row[f"{n}_theta"] = theta
-                row[f"{n}_angle"] = wrap_angle(theta - body_angle) if np.isfinite(body_angle) else np.nan
-            else:
-                row[f"{n}_x"] = row[f"{n}_y"] = row[f"{n}_z"] = np.nan
-                row[f"{n}_theta"] = row[f"{n}_angle"] = np.nan
+    log("\n=== Body-angle fit ===")
+    log(f"Frames skipped (absolute, <2 nodes)   : {skipped_abs}")
+    log(f"Frames skipped (incremental, <2 shared): {skipped_incr}")
 
-        row["centroid_x"] = centroid_x
-        row["centroid_y"] = centroid_y
-        row["body_angle"] = body_angle
-        row["body_angle_incremental"] = body_angle_incremental
+    # --- Optional sensor heading merge ------------------------------------ #
+    heading_source = "tag"
+    sensor = None
+    if args.sensor_csv:
+        sensor = load_and_sync_sensor(args.sensor_csv, nodes, total_frames, fps,
+                                      xw, yw, body_angle, args, log)
+        if sensor is not None:
+            heading_source = "sensor"
+    log(f"\nHeading source: {heading_source}")
+
+    # --- Per-frame assembly ----------------------------------------------- #
+    rows = []
+    for t in range(total_frames):
+        row = {"time": t / fps}
+        for n in nodes:
+            has_pos = n in xw.columns
+            row[f"{n}_x"] = xw.at[t, n] if has_pos else np.nan
+            row[f"{n}_y"] = yw.at[t, n] if has_pos else np.nan
+            row[f"{n}_z"] = zw.at[t, n] if (has_pos and n in zw.columns) else np.nan
+            if heading_source == "sensor" and n in sensor["theta_lab"]:
+                row[f"{n}_theta"] = sensor["theta_lab"][n][t]
+                row[f"{n}_angle"] = sensor["angle_body"][n][t]
+            else:
+                theta = aw.at[t, n] if has_pos else np.nan
+                row[f"{n}_theta"] = theta
+                row[f"{n}_angle"] = (wrap_angle(theta - body_angle[t])
+                                     if (np.isfinite(theta) and np.isfinite(body_angle[t]))
+                                     else np.nan)
+            if heading_source == "sensor":
+                row[f"{n}_encoder"] = sensor["encoder"][n][t] if n in sensor["encoder"] else np.nan
+                row[f"{n}_motor"] = sensor["motor"][n][t] if n in sensor["motor"] else np.nan
+
+        row["centroid_x"] = centroid_x[t]
+        row["centroid_y"] = centroid_y[t]
+        row["body_angle"] = body_angle[t]
+        row["body_angle_incremental"] = body_angle_incr[t]
 
         for e in extra_tags:
             row[f"extra_tag_{e}_x"] = xw.at[t, e] if e in xw.columns else np.nan
@@ -426,10 +595,6 @@ def main():
         rows.append(row)
 
     robot_df = pd.DataFrame(rows)
-
-    log("\n=== Body-angle fit ===")
-    log(f"Frames skipped (absolute, <2 nodes)   : {skipped_abs}")
-    log(f"Frames skipped (incremental, <2 shared): {skipped_incr}")
 
     # --- Write CSV with metadata header ----------------------------------- #
     attrs = {
@@ -443,7 +608,15 @@ def main():
         "arena_size": list(args.arena_size) if args.arena_size else None,
         "frame": frame_label,
         "fps": fps,
+        "heading_source": heading_source,
     }
+    if sensor is not None:
+        attrs["sensor_angle_units"] = args.sensor_angle_units
+        attrs["sensor_sync_offset_s"] = round(sensor["offset"], 6)
+        attrs["motion_onset_frame"] = sensor["onset_frame"]
+        attrs["motor_onset_time_s"] = round(sensor["motor_onset"], 6)
+        attrs["sensor_nodes"] = sensor["sensor_nodes"]
+        attrs["tag_mount"] = "body"   # tag is body-fixed when the sensor provides the heading
     with open(out_csv, "w") as f:
         for key, value in attrs.items():
             f.write(f"# {key}: {value}\n")
