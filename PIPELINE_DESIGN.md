@@ -152,13 +152,20 @@ interpolate gaps, transform into the lab frame, compute centroid and body angle.
 
 - **Centroid** = mean of node positions each frame (the natural, unambiguous translational
   coordinate; equals center of mass for equal masses).
-- **`body_angle` (absolute)** via **Procrustes / Kabsch** fit of the node positions to a
-  **regular-polygon template** (hub at origin, ring nodes on a circle of radius `--baseline`
-  in ascending id order). This is the standard least-squares (Eckart-frame) resolution of the
-  rigid rotation of a *deformable* body — the rotation that minimizes residual deformation.
-  Labeled tags remove the polygon's rotational-symmetry ambiguity. The template radius does
-  **not** affect the fitted angle (Kabsch rotation is scale-invariant); `--baseline` only sets
-  the template's radius and is otherwise cosmetic here.
+- **`body_angle` (absolute)** via **Procrustes / Kabsch** fit of the node positions to an
+  **idealized per-topology template** (from `robot_topology.py`). This is the standard
+  least-squares (Eckart-frame) resolution of the rigid rotation of a *deformable* body — the
+  rotation that minimizes residual deformation. Labeled tags remove the polygon's
+  rotational-symmetry ambiguity. The template radius does **not** affect the fitted angle
+  (Kabsch is scale-invariant).
+  - **Topology dispatch** (`--topology`, default `auto` = by node count): **7 → `hub_spoke`**
+    (hub at origin + 6 ring nodes on a circle), **6 → `ring`** (regular hexagon, no hub). New
+    topologies are added in `robot_topology.py` as needed; the same module feeds
+    `analyze_modes.py`'s Hessian reference so the geometry can't drift between the two. An
+    **idealized** template (not the mean shape) is used deliberately: the robot is flexible, so
+    a data-derived mean shape is not repeatable across experiments. The resolved topology is
+    written to the CSV header (`topology`) and reused downstream. Unknown node counts warn and
+    fall back to the (non-repeatable) mean shape.
 - **`body_angle_incremental`** via reference-free frame-to-frame Kabsch, integrated and
   unwrapped. Requested because for a deformable body the absolute angle depends on the (choice
   of) reference, whereas the integrated frame-to-frame rotation is reference-free and more
@@ -373,7 +380,9 @@ actuation (coupling, actuation spectrum, condensation)  12. Phase portraits (dom
 first two non-zero modes)  13. Per-mode effective temperature  14. Chirality (ω + polarization
 angle)  15. Orientational ACF + VACF  16. Active force vs CoM velocity  17. Spatial polarity
 (bond alignment + winding)  18. Per-node angular-velocity PSD (7 curves)  19. Pairwise node
-velocity correlation heatmap  20. Pairwise heading angular-velocity correlation heatmap.
+velocity correlation heatmap  20. Pairwise heading angular-velocity correlation heatmap
+21. Heading kymograph over the ring (time × node, hue = caster angle)  22. Interior bond-angle
+(∠ABC) deviation kymograph (time × node), centered on the regular n-gon interior angle.
 
 ---
 
@@ -477,6 +486,7 @@ arguments are required; all `--flags` are optional with the defaults shown.
 | `--motion-onset-frame` | auto | Manual video motion-onset frame for sensor sync (overrides auto-detection). |
 | `--motion-threshold` | auto | Manual speed threshold for motion-onset detection (overrides the auto noise floor). |
 | `--baseline` | derived from data | Node-to-node template radius (m); does **not** affect the fitted body angle. |
+| `--topology` | `auto` (7=hub_spoke, 6=ring) | Reference topology for the body-angle template (from `robot_topology.py`). |
 | `--fps` | raw-CSV header, else 30 | Override the frame rate. |
 | `--output` | `<raw>_robot.csv` | Output wide CSV path. |
 | `--log` | `<raw>_robot.log` | Text log path (stats + warnings). |
@@ -488,7 +498,8 @@ arguments are required; all `--flags` are optional with the defaults shown.
 | `robot_csv` (positional) | — | Formatted CSV from `format_tracks.py`. |
 | `--k` | `1.0` | Uniform spring constant. |
 | `--l0` | each bond's equilibrium length | Uniform spring rest length; omit for a relaxed network (no pre-tension). |
-| `--baseline` | CSV header, else derived | Template radius (m). |
+| `--baseline` | CSV header, else derived | Template radius (m); else the mean observed spring length. |
+| `--topology` | `auto` (from CSV header / node count) | Reference topology for the Hessian + body frame (`robot_topology.py`). |
 | `--angle-frame` | `lab` | Caster-angle frame for order parameter/projections/diffusion: `lab` uses `{n}_theta`, `body` uses `{n}_angle`. |
 | `--nematic` | off (polar) | Use nematic order parameter \|⟨e^{2iθ}⟩\| instead of polar. |
 | `--vel-smooth-window` | `0` (off) | Savitzky-Golay window (odd frames) for the velocity estimate; velocity = SG analytic derivative (deriv=1). `0` = plain central difference. Suppresses the finite-difference noise floor in KE. |

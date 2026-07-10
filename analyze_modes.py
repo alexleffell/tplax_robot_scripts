@@ -43,6 +43,8 @@ import numpy as np
 import pandas as pd
 from scipy.signal import welch, savgol_filter
 
+from robot_topology import reference_template
+
 DEFAULT_MODES_DIR = "/Users/alexleffell/Documents/PhD/tplax/tplax_paper"
 
 
@@ -68,42 +70,31 @@ def read_csv_comments(path):
 
 
 # --------------------------------------------------------------------------- #
-# Reference configuration (regular-polygon template)
+# Reference configuration (idealized per-topology template; see robot_topology.py)
 # --------------------------------------------------------------------------- #
-def build_reference(nodes, connections, baseline, X, Y, log):
-    """Regular-polygon reference positions {node: (x, y)} in template coordinates.
+def build_reference(nodes, connections, baseline, topology, X, Y, log):
+    """Idealized reference positions {node: (x, y)} for the topology.
 
-    Hub (max-degree node) at the origin; ring nodes on a circle of radius `baseline`
-    in ascending id order. Falls back to the time-averaged shape for non-star graphs.
-    X, Y are (T, N) arrays whose columns follow `nodes` order.
+    Radius = --baseline if given, else the mean observed spring (edge) length (= the
+    circumradius for the ring/hub-spoke lattices). Falls back to the time-averaged shape
+    for unknown topologies. X, Y are (T, N) arrays whose columns follow `nodes` order.
     """
     col = {n: i for i, n in enumerate(nodes)}
-    degree = {n: 0 for n in nodes}
-    for a, b in connections:
-        degree[a] += 1
-        degree[b] += 1
-    hub = min(nodes, key=lambda n: (-degree[n], n))
-    ring = [n for n in nodes if n != hub]
-    conn_set = {frozenset(c) for c in connections}
-    is_star = all(frozenset((hub, n)) in conn_set for n in ring)
-
-    if not is_star:
-        log("WARNING: non-hub-and-spoke topology; using time-averaged shape as the "
-            "reference configuration.")
-        return {n: (float(np.nanmean(X[:, col[n]])), float(np.nanmean(Y[:, col[n]]))) for n in nodes}
-
     r = baseline
     if r is None:
-        dists = [np.nanmean(np.hypot(X[:, col[n]] - X[:, col[hub]],
-                                     Y[:, col[n]] - Y[:, col[hub]])) for n in ring]
-        r = float(np.nanmean(dists))
-        log(f"Derived baseline (mean hub->ring distance): {r:.5f}")
-    ref = {hub: (0.0, 0.0)}
-    m = len(ring)
-    for k, n in enumerate(ring):
-        ref[n] = (r * np.cos(2 * np.pi * k / m), r * np.sin(2 * np.pi * k / m))
-    log(f"Reference: hub={hub}, ring={ring}, radius={r:.5f}")
-    return ref
+        edge = [np.nanmean(np.hypot(X[:, col[a]] - X[:, col[b]], Y[:, col[a]] - Y[:, col[b]]))
+                for a, b in connections]
+        edge = [e for e in edge if np.isfinite(e)]
+        r = float(np.nanmean(edge)) if edge else 1.0
+        log(f"Derived radius (mean spring length): {r:.5f}")
+
+    template, topo = reference_template(nodes, connections, topology, radius=r)
+    if template is None:
+        log(f"WARNING: no built-in template for topology '{topo}' ({len(nodes)} nodes); "
+            f"using the time-averaged shape (not repeatable). Add it to robot_topology.py.")
+        return {n: (float(np.nanmean(X[:, col[n]])), float(np.nanmean(Y[:, col[n]]))) for n in nodes}, topo
+    log(f"Reference: topology={topo}, radius={r:.5f}")
+    return template, topo
 
 
 # --------------------------------------------------------------------------- #
@@ -135,6 +126,50 @@ def build_hessian(nodes, connections, ref, k, l0):
             K[2 * p:2 * p + 2, 2 * q:2 * q + 2] += s * kb
     K = 0.5 * (K + K.T)  # symmetrize against round-off
     return K
+
+
+def rigid_body_modes(ref_arr):
+    """Orthonormal 2N x 3 basis of the rigid-body subspace (x-translation, y-translation,
+    infinitesimal rotation about the centroid) at the reference configuration."""
+    N = len(ref_arr)
+    r = ref_arr - ref_arr.mean(axis=0)
+    tx = np.zeros(2 * N); tx[0::2] = 1.0
+    ty = np.zeros(2 * N); ty[1::2] = 1.0
+    rot = np.zeros(2 * N); rot[0::2] = -r[:, 1]; rot[1::2] = r[:, 0]
+    Rb, _ = np.linalg.qr(np.stack([tx, ty, rot], axis=1))
+    return Rb[:, :3]
+
+
+def separate_rigid_mechanism(evals, evecs, ref_arr, tol):
+    """Rebasis the (near-)null block of the Hessian into a clean rigid part + mechanism part.
+
+    The lambda~0 block mixes the 3 rigid-body modes with any floppy mechanism modes, and eigh
+    returns an arbitrary basis inside it. We replace that block IN PLACE with [rigid (3),
+    mechanism (rest)] using the analytic rigid-body subspace, so afterwards modes 0..2 are
+    truly rigid and 3.. are non-rigid (mechanisms first, then stiff). Returns
+    (evecs, rigid_idx, mechanism_idx, deform_idx). evecs stays orthonormal.
+    """
+    two_n = evecs.shape[0]
+    null_idx = np.where(np.abs(evals) < tol)[0]
+    if len(null_idx) < 3:
+        rigid_idx = np.arange(min(3, two_n))
+        deform_idx = np.array([i for i in range(two_n) if i not in set(rigid_idx.tolist())])
+        return evecs, rigid_idx, np.array([], dtype=int), deform_idx
+
+    Rb = rigid_body_modes(ref_arr)
+    U0 = evecs[:, null_idx]                          # (2N, n0) basis of the null block
+    rigid_b, _ = np.linalg.qr(U0 @ (U0.T @ Rb))      # rigid subspace expressed within the block
+    rigid_b = rigid_b[:, :3]
+    Mproj = U0 @ U0.T - rigid_b @ rigid_b.T           # projector onto the mechanism part of U0
+    w, Vv = np.linalg.eigh(Mproj)
+    mech_b = Vv[:, w > 0.5]                            # eigenvalues ~1 span the mechanism subspace
+    evecs = evecs.copy()
+    evecs[:, null_idx] = np.concatenate([rigid_b, mech_b], axis=1)
+    n_mech = mech_b.shape[1]
+    rigid_idx = null_idx[:3]
+    mechanism_idx = null_idx[3:3 + n_mech]
+    deform_idx = np.array([i for i in range(two_n) if i not in set(rigid_idx.tolist())])
+    return evecs, rigid_idx, mechanism_idx, deform_idx
 
 
 def graph_laplacian(nodes, connections):
@@ -280,6 +315,9 @@ def parse_args():
                         "(relaxed network, no pre-tension).")
     p.add_argument("--baseline", type=float, default=None,
                    help="Template radius. Default: from CSV header, else derived from data.")
+    p.add_argument("--topology", type=str, default="auto",
+                   help="Reference topology for the Hessian/body frame: 'auto' (from the CSV "
+                        "header, else by node count) or an explicit name from robot_topology.py.")
     p.add_argument("--angle-frame", choices=["lab", "body"], default="lab",
                    help="Caster-angle frame for order parameter, projections, and diffusion: "
                         "'lab' uses {n}_theta (default), 'body' uses {n}_angle (rigid rotation removed).")
@@ -373,7 +411,8 @@ def main():
     vel_def, v_cm, omega = remove_rigid(pos, vel)
 
     # --- Elastic normal modes ------------------------------------------- #
-    ref = build_reference(nodes, connections, baseline, X, Y, log)
+    topology = args.topology if args.topology != "auto" else meta.get("topology", "auto")
+    ref, topo = build_reference(nodes, connections, baseline, topology, X, Y, log)
     ref_arr = np.array([ref[n] for n in nodes])
     radius = float(np.mean(np.linalg.norm(ref_arr - ref_arr.mean(axis=0), axis=1)))
     l0 = args.l0
@@ -383,10 +422,15 @@ def main():
         K, nodes, connections, args.k, l0, radius, ref_arr,
         args.modes_dir, args.recompute_modes, log)
     n_zero_numeric = int(np.sum(np.abs(evals) < args.zero_mode_tol))
-    rigid_idx = np.arange(3)                               # 2 translations + 1 rotation
-    deform_idx = np.arange(3, 2 * N)
+    # Cleanly split the lambda~0 block into rigid + mechanism (the [0,1,2]=rigid assumption
+    # is wrong for a floppy lattice, where rigid and mechanism modes are degenerate and mixed).
+    # After this, modes rigid_idx are truly rigid; deform_idx (mechanism + stiff) are all
+    # non-rigid, so every modal projection below is effectively rigid-frame.
+    evecs, rigid_idx, mechanism_idx, deform_idx = separate_rigid_mechanism(
+        evals, evecs, ref_arr, args.zero_mode_tol)
     log(f"Elastic spectrum: {2 * N} modes ({modes_source}); "
-        f"{n_zero_numeric} within |lambda|<{args.zero_mode_tol:g}")
+        f"{n_zero_numeric} within |lambda|<{args.zero_mode_tol:g} "
+        f"-> {len(rigid_idx)} rigid + {len(mechanism_idx)} mechanism (floppy zero) modes.")
     log(f"  lowest eigenvalues: {np.array2string(evals[:min(6, 2*N)], precision=4)}")
 
     # Flatten velocities to (T, 2N) in [x0,y0,x1,y1,...] order.
@@ -444,10 +488,25 @@ def main():
     P = np.zeros((T, 2 * N))
     P[:, 0::2] = np.cos(TH)
     P[:, 1::2] = np.sin(TH)
-    C = P @ evecs                                           # (T, 2N)
+    C = P @ evecs                                           # (T, 2N) drive->mode overlap
     P_norm2 = (P ** 2).sum(axis=1)                          # == N (unit polarity)
-    elastic_zero_ratio = np.divide((C[:, rigid_idx] ** 2).sum(axis=1), P_norm2,
-                                   out=np.zeros(T), where=P_norm2 > 0)
+    # C on the rigid modes is the net-propulsion component; the "zero-mode" (mechanism)
+    # overlap is on the mechanism modes.
+    elastic_zero_ratio = np.divide((C[:, mechanism_idx] ** 2).sum(axis=1) if len(mechanism_idx)
+                                    else np.zeros(T), P_norm2, out=np.zeros(T), where=P_norm2 > 0)
+    propulsion_ratio = np.divide((C[:, rigid_idx] ** 2).sum(axis=1), P_norm2,
+                                 out=np.zeros(T), where=P_norm2 > 0)
+    # Time-mean polarity per node (body/selected frame). Note: for an oscillating/chiral drive
+    # this is ~0 (the average cancels), so it is NOT the pattern that overlaps the modes.
+    mean_polarity = np.stack([np.nanmean(np.cos(TH), axis=0), np.nanmean(np.sin(TH), axis=0)], axis=1)
+    # POD (PCA) of the polarity field: the dominant spatial DRIVE patterns. Because
+    # <C_i^2> = sum_k s_k^2 (pod_k . u_i)^2, a mode's drive overlap is exactly its alignment
+    # with these high-variance patterns -- so these (not the time-mean) are what to overlay.
+    Pc = P - P.mean(axis=0, keepdims=True)
+    _, S_pod, Vt_pod = np.linalg.svd(Pc, full_matrices=False)
+    n_pod = min(3, Vt_pod.shape[0])
+    pod_polarity = Vt_pod[:n_pod]                          # (n_pod, 2N) leading drive patterns
+    pod_variance = (S_pod[:n_pod] ** 2) / (S_pod ** 2).sum()
 
     # --- Orientation order parameter ------------------------------------ #
     mult = 2 if args.nematic else 1
@@ -490,9 +549,10 @@ def main():
             actuation_spectrum[i] = np.corrcoef(C[:, i], A_def[:, i])[0, 1]
     actuation_coproj = (np.abs(C) * np.abs(A_def)).mean(axis=0)   # (2N,) co-projection magnitude
 
-    # (2) Participation ratio / spectral entropy of the deformation modal energy.
-    Etot_modal = modal_KE.sum(axis=1)
-    pmode = np.divide(modal_KE, Etot_modal[:, None], out=np.zeros_like(modal_KE),
+    # (2) Participation ratio / spectral entropy over the NON-RIGID modes only (rigid excluded).
+    Kd = modal_KE[:, deform_idx]
+    Etot_modal = Kd.sum(axis=1)
+    pmode = np.divide(Kd, Etot_modal[:, None], out=np.zeros_like(Kd),
                       where=Etot_modal[:, None] > 0)
     participation_ratio = np.divide(1.0, (pmode ** 2).sum(axis=1),
                                     out=np.full(T, np.nan), where=Etot_modal > 0)
@@ -546,14 +606,75 @@ def main():
     for (a, b) in connections:
         bond_align += np.cos(TH[:, idx[a]] - TH[:, idx[b]])
     bond_align /= len(connections)
-    hub, ring = hub_and_ring(nodes, connections)
+    if topo == "ring":
+        ring = sorted(nodes)                       # all nodes form the cycle (ascending id order)
+    elif topo == "hub_spoke":
+        _, ring = hub_and_ring(nodes, connections)
+    else:
+        ring = None
     if ring is not None and len(ring) >= 3:
-        ring_cols = [idx[n] for n in ring]
-        ring_th = TH[:, ring_cols]
+        ring_th = TH[:, [idx[n] for n in ring]]
         dth = np.diff(np.concatenate([ring_th, ring_th[:, :1]], axis=1), axis=1)
         winding = ((dth + np.pi) % (2 * np.pi) - np.pi).sum(axis=1) / (2 * np.pi)
     else:
         winding = np.full(T, np.nan)
+
+    # (9) Kymograph series over the ring (for the heading + bond-angle kymographs).
+    #     ring_headings: per-ring-node caster heading (wrapped). bond_angle_dev: interior
+    #     angle /_ABC at each node B (between its two ring neighbours A, C), minus the regular
+    #     n-gon interior angle 180(n-2)/n (=120 deg for a hexagon), so undeformed reads ~0.
+    if ring is not None and len(ring) >= 3:
+        rcols = [idx[n] for n in ring]
+        m = len(ring)
+        ring_nodes = np.array(ring)
+        ring_headings = wrap(TH[:, rcols])                      # (T, m)
+        bond_angle_baseline = np.pi * (m - 2) / m               # regular interior angle (rad)
+        bond_angle_dev = np.zeros((T, m))
+        for k in range(m):
+            iB, iA, iC = rcols[k], rcols[(k - 1) % m], rcols[(k + 1) % m]
+            ux, uy = X[:, iA] - X[:, iB], Y[:, iA] - Y[:, iB]
+            vx, vy = X[:, iC] - X[:, iB], Y[:, iC] - Y[:, iB]
+            interior = np.arctan2(np.abs(ux * vy - uy * vx), ux * vx + uy * vy)  # [0, pi]
+            bond_angle_dev[:, k] = interior - bond_angle_baseline
+    else:
+        ring_nodes = np.array([])
+        ring_headings = np.zeros((T, 0))
+        bond_angle_dev = np.zeros((T, 0))
+        bond_angle_baseline = np.nan
+
+    # --- Degenerate-mode banding --------------------------------------- #
+    # Group modes with (near-)equal eigenvalues. Within a degenerate group eigh's basis is
+    # arbitrary, so only the per-BAND energy is physically meaningful; banding also un-dilutes
+    # condensation that is spread across a degenerate group (e.g. the floppy shear in the
+    # lambda~0 block). Uses a lambda-independent metric (modal KE and displacement variance).
+    def group_bands(members, vals, atol=1e-6, rtol=1e-3):
+        order = sorted(members, key=lambda i: vals[i])
+        groups = [[int(order[0])]]
+        for k in order[1:]:
+            prev = vals[groups[-1][-1]]
+            if abs(vals[k] - prev) <= atol + rtol * abs(prev):
+                groups[-1].append(int(k))
+            else:
+                groups.append([int(k)])
+        return groups
+
+    # Band the NON-RIGID modes only (rigid excluded), so the lambda~0 band = mechanisms.
+    bands = group_bands(list(deform_idx), evals)
+    band_lambdas = np.array([float(np.mean(evals[b])) for b in bands])
+    band_sizes = np.array([len(b) for b in bands])
+    mean_KE_mode = modal_KE.mean(axis=0)
+    mean_Q2_mode = (Q ** 2).mean(axis=0)
+    mean_C2_mode = (C ** 2).mean(axis=0)                   # drive->mode overlap power
+    band_KE = np.array([float(mean_KE_mode[b].sum()) for b in bands])
+    band_Q2 = np.array([float(mean_Q2_mode[b].sum()) for b in bands])
+    band_drive = np.array([float(mean_C2_mode[b].sum()) for b in bands])
+    # Banded participation ratio (over degenerate groups) -- the condensation measure that
+    # is not fooled by energy split across degenerate partners.
+    band_energy_t = np.stack([modal_KE[:, b].sum(axis=1) for b in bands], axis=1)  # (T, n_bands)
+    Eb = band_energy_t.sum(axis=1)
+    pb = np.divide(band_energy_t, Eb[:, None], out=np.zeros_like(band_energy_t), where=Eb[:, None] > 0)
+    band_participation = np.divide(1.0, (pb ** 2).sum(axis=1),
+                                   out=np.full(T, np.nan), where=Eb > 0)
 
     # --- PSDs ----------------------------------------------------------- #
     nper = min(256, T)
@@ -640,6 +761,12 @@ def main():
         f"{np.nanmean(coupling_pvdef):+.4f} (deformation)")
     log(f"Mean participation ratio / entropy      : {np.nanmean(participation_ratio):.3f} / "
         f"{np.nanmean(spectral_entropy):.3f}   (of {len(deform_idx)} deformation modes)")
+    log(f"Mean BANDED participation ratio          : {np.nanmean(band_participation):.3f}   "
+        f"(of {len(bands)} degenerate bands)")
+    log("Degenerate-mode bands (lambda-independent energy):")
+    for lam, sz, ke, q2 in zip(band_lambdas, band_sizes, band_KE, band_Q2):
+        log(f"  lambda={lam:+.3f}  n={sz}  KE frac={ke / band_KE.sum():.3f}  "
+            f"<Q^2> frac={q2 / band_Q2.sum():.3f}")
     log(f"Dominant deformation modes              : {dominant_modes.tolist()}")
     log(f"First two non-zero modes (phase portrait): {first_two_nonzero.tolist()}")
     log(f"Mean body angular velocity <omega>      : {mean_omega:+.5e} +/- {std_omega:.3e}")
@@ -649,7 +776,8 @@ def main():
     log(f"Mean absolute internal (deformation) KE : {np.nanmean(KE_deform):.5e}")
     log(f"Mean absolute rigid-body KE             : {np.nanmean(KE_zero):.5e}")
     log(f"Mean bond alignment <cos dtheta>        : {np.nanmean(bond_align):+.4f}")
-    log(f"Mean ring winding number                : {np.nanmean(winding):+.4f}")
+    mean_winding = float(np.nanmean(winding)) if np.isfinite(winding).any() else np.nan
+    log(f"Mean ring winding number                : {mean_winding:+.4f}")
     log(f"Mean active-force / CoM-velocity align  : {mean_force_vel_alignment:+.4f}")
 
     # --- Save ----------------------------------------------------------- #
@@ -679,6 +807,8 @@ def main():
         active_force=active_force, v_com=v_com, force_vel_cos=force_vel_cos,
         mean_force_vel_alignment=mean_force_vel_alignment,
         bond_align=bond_align, winding=winding,
+        ring_nodes=ring_nodes, ring_headings=ring_headings,
+        bond_angle_dev=bond_angle_dev, bond_angle_baseline=bond_angle_baseline,
         # energies
         spring_len=spring_len, spring_PE=spring_PE,
         KE_total=KE_total, PE_total=PE_total, E_total=E_total,
@@ -694,6 +824,11 @@ def main():
         psd_freq=psd_freq, psd_order=psd_order, psd_KE=psd_KE, psd_PE=psd_PE,
         modal_energy_psd=modal_energy_psd,
         node_omega_psd=node_omega_psd, vel_corr=vel_corr, omega_corr=omega_corr,
+        band_lambdas=band_lambdas, band_sizes=band_sizes, band_KE=band_KE, band_Q2=band_Q2,
+        band_drive=band_drive, band_participation=band_participation,
+        mechanism_idx=mechanism_idx, mean_polarity=mean_polarity,
+        pod_polarity=pod_polarity, pod_variance=pod_variance,
+        elastic_zero_ratio_mech=elastic_zero_ratio, propulsion_ratio=propulsion_ratio,
         # params
         k=args.k, l0=(l0 if l0 is not None else np.nan), baseline=(baseline if baseline else np.nan),
     )

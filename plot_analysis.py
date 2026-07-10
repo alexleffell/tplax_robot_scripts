@@ -25,6 +25,8 @@ output directory. Figures:
  18. Per-node angular-velocity PSD (one curve per node)
  19. Pairwise node velocity correlation heatmap
  20. Pairwise heading angular-velocity correlation heatmap
+ 21. Heading kymograph over the ring (time x node, hue = caster angle)
+ 22. Interior bond-angle (/_ABC) deviation kymograph (time x node)
 
 Every figure is footer-stamped and filename-tagged with the heading source and angle frame.
 
@@ -380,6 +382,113 @@ def main():
     if "omega_corr" in d.files:
         corr_heatmap(d["omega_corr"], "Pairwise heading angular-velocity correlation",
                      "20_angular_velocity_correlation.png")
+
+    # 21. Heading kymograph over the ring (time x node, hue = heading).
+    if "ring_headings" in d.files and np.asarray(d["ring_headings"]).shape[1] >= 1:
+        rh = np.degrees(d["ring_headings"])      # (T, m)
+        rn = d["ring_nodes"]
+        fig, ax = plt.subplots(figsize=(11, 4))
+        im = ax.imshow(rh.T, aspect="auto", origin="lower", interpolation="nearest",
+                       extent=[time[0], time[-1], -0.5, len(rn) - 0.5],
+                       cmap="hsv", vmin=-180, vmax=180)
+        ax.set_yticks(range(len(rn))); ax.set_yticklabels([int(n) for n in rn])
+        ax.set_xlabel("time"); ax.set_ylabel("ring node")
+        ax.set_title("Heading kymograph (hue = caster angle)")
+        fig.colorbar(im, ax=ax, label="heading (deg)")
+        save(fig, "21_heading_kymograph.png")
+
+    # 22. Bond-angle (interior /_ABC) deviation kymograph (time x node).
+    if "bond_angle_dev" in d.files and np.asarray(d["bond_angle_dev"]).shape[1] >= 1:
+        bd = np.degrees(d["bond_angle_dev"])     # (T, m)
+        rn = d["ring_nodes"]
+        lim = float(np.nanpercentile(np.abs(bd), 99)) or 1.0
+        base = np.degrees(float(d["bond_angle_baseline"]))
+        fig, ax = plt.subplots(figsize=(11, 4))
+        im = ax.imshow(bd.T, aspect="auto", origin="lower", interpolation="nearest",
+                       extent=[time[0], time[-1], -0.5, len(rn) - 0.5],
+                       cmap="RdBu_r", vmin=-lim, vmax=lim)
+        ax.set_yticks(range(len(rn))); ax.set_yticklabels([int(n) for n in rn])
+        ax.set_xlabel("time"); ax.set_ylabel("ring node (B)")
+        ax.set_title(f"Interior bond-angle deviation from {base:.0f}° (∠ABC)")
+        fig.colorbar(im, ax=ax, label="deviation (deg)")
+        save(fig, "22_bond_angle_kymograph.png")
+
+    # 23. Banded modal energy (grouped by degenerate eigenvalue). A lambda-independent
+    #     condensation view: energy summed within each degenerate group, so a mode split
+    #     across degenerate partners isn't diluted (complements figs 7 & 13, which stay per-mode).
+    if "band_lambdas" in d.files and len(d["band_lambdas"]) > 0:
+        bl, bs = d["band_lambdas"], d["band_sizes"]
+        bKE, bQ2 = d["band_KE"], d["band_Q2"]
+        labels = [f"λ={l:.2g}\n(n={int(n)})" for l, n in zip(bl, bs)]
+        xb = np.arange(len(bl))
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        axes[0].bar(xb, bKE / bKE.sum(), color="C0")
+        axes[0].set_xticks(xb); axes[0].set_xticklabels(labels, fontsize=8)
+        axes[0].set_ylabel("KE fraction"); axes[0].set_title("Banded modal KE")
+        axes[1].bar(xb, bQ2 / bQ2.sum(), color="C2")
+        axes[1].set_xticks(xb); axes[1].set_xticklabels(labels, fontsize=8)
+        axes[1].set_ylabel(r"$\langle Q^2\rangle$ fraction"); axes[1].set_title("Banded displacement variance")
+        pr = float(np.nanmean(d["band_participation"])) if "band_participation" in d.files else float("nan")
+        fig.suptitle(f"Energy by degenerate mode band (banded participation ratio {pr:.2f})")
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        save(fig, "23_banded_modal_energy.png")
+
+    # 24. Drive overlap vs response, by degenerate band (rigid modes excluded). Shows that the
+    #     active-caster forcing selects the modes it overlaps.
+    if "band_drive" in d.files and len(d["band_lambdas"]) > 0:
+        bl, bs = d["band_lambdas"], d["band_sizes"]
+        bdr, bq = d["band_drive"], d["band_Q2"]
+        labels = [f"λ={l:.2g}\n(n={int(n)})" for l, n in zip(bl, bs)]
+        xb = np.arange(len(bl)); w = 0.38
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.bar(xb - w / 2, bdr / bdr.sum(), w, label=r"drive overlap $\langle C^2\rangle$", color="C3")
+        ax.bar(xb + w / 2, bq / bq.sum(), w, label=r"response $\langle Q^2\rangle$", color="C2")
+        ax.set_xticks(xb); ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel("fraction"); ax.set_title("Drive overlap vs response, by mode band (rigid excluded)")
+        ax.legend()
+        save(fig, "24_drive_vs_response.png")
+
+    # 25. Drive-field / mode-shape overlay for the top non-rigid modes: eigenvector (blue) vs
+    #     the dominant POD drive pattern (red), sign-aligned per mode. The POD pattern (not the
+    #     time-mean polarity, which cancels for an oscillating drive) is what overlaps the modes.
+    if "pod_polarity" in d.files and np.asarray(d["pod_polarity"]).size and "ref" in d.files:
+        ref = d["ref"]; evecs = d["eigenvectors"]; evals = d["eigenvalues"]
+        di = np.array(d["deform_idx"])
+        pod1 = np.asarray(d["pod_polarity"])[0]           # leading drive pattern (2N,)
+        podfrac = float(np.asarray(d["pod_variance"])[0])
+        idx = {int(n): i for i, n in enumerate(nodes)}
+        bonds = [(idx[int(a)], idx[int(b)]) for a, b in d["connections"]]
+        respd = (d["modal_disp"] ** 2).mean(0)
+        top = di[np.argsort(respd[di])[::-1][:min(args.n_modes, len(di))]]
+        bl_ = np.max(np.linalg.norm(ref - ref.mean(0), axis=1))
+        ncol = min(4, len(top)); nrow = int(np.ceil(len(top) / ncol))
+        fig, axes = plt.subplots(nrow, ncol, figsize=(3.3 * ncol, 3.3 * nrow), squeeze=False)
+        for j in range(nrow * ncol):
+            ax = axes[j // ncol][j % ncol]
+            if j >= len(top):
+                ax.axis("off"); continue
+            mi = int(top[j])
+            u = evecs[:, mi]
+            sign = np.sign(pod1 @ u) or 1.0               # align sign for display
+            for (a, b) in bonds:
+                ax.plot(ref[[a, b], 0], ref[[a, b], 1], color="0.85", lw=1, zorder=1)
+            v = u.reshape(len(nodes), 2)
+            v = v / (np.max(np.linalg.norm(v, axis=1)) or 1.0) * 0.45 * bl_
+            p = (sign * pod1).reshape(len(nodes), 2)
+            p = p / (np.max(np.linalg.norm(p, axis=1)) or 1.0) * 0.45 * bl_
+            ax.quiver(ref[:, 0], ref[:, 1], v[:, 0], v[:, 1], color="C0",
+                      angles="xy", scale_units="xy", scale=1, zorder=3,
+                      label="mode shape" if j == 0 else None)
+            ax.quiver(ref[:, 0], ref[:, 1], p[:, 0], p[:, 1], color="C3", alpha=0.7,
+                      angles="xy", scale_units="xy", scale=1, zorder=2,
+                      label="drive (POD-1)" if j == 0 else None)
+            ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title(f"mode {mi} (λ={evals[mi]:.2g}), |POD·u|={abs(pod1 @ u):.2f}", fontsize=9)
+        fig.legend(loc="upper right", fontsize=8)
+        fig.suptitle(f"Dominant drive pattern (red, POD-1, {podfrac:.0%} of drive var) "
+                     f"vs mode shape (blue)")
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        save(fig, "25_drive_mode_overlap.png")
 
     print(f"\nWrote {len(saved)} figures to {outdir}/")
 

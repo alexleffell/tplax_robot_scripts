@@ -38,6 +38,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
+from robot_topology import reference_template
+
 DEFAULT_CONNECTIONS = [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6),
                        (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 1)]
 
@@ -192,57 +194,6 @@ def kabsch_angle(A, B):
     d = np.sign(np.linalg.det(Vt.T @ U.T))
     R = Vt.T @ np.diag([1.0, d]) @ U.T
     return float(np.arctan2(R[1, 0], R[0, 0]))
-
-
-def build_template(nodes, connections, baseline, xw, yw, log):
-    """Regular-polygon template: hub at origin, ring nodes on a circle in ascending id order.
-
-    Returns a dict {node_id: (x, y)} or None if a regular template can't be inferred
-    (caller then falls back to the mean shape).
-    """
-    degree = {n: 0 for n in nodes}
-    for a, b in connections:
-        degree[a] += 1
-        degree[b] += 1
-    hub = min((n for n in nodes), key=lambda n: (-degree[n], n))
-    ring = [n for n in nodes if n != hub]
-
-    # Star topology check: hub connects to every ring node.
-    conn_set = {frozenset(c) for c in connections}
-    is_star = all(frozenset((hub, n)) in conn_set for n in ring)
-    if not is_star:
-        log(f"WARNING: connections are not hub-and-spoke (hub={hub}); "
-            f"falling back to a time-averaged mean-shape template for body_angle.")
-        return None
-
-    r = baseline
-    if r is None:
-        # Mean hub->ring distance over all frames, using only detected nodes.
-        dists = []
-        if hub in xw.columns:
-            for n in ring:
-                if n in xw.columns:
-                    dx = xw[n].values - xw[hub].values
-                    dy = yw[n].values - yw[hub].values
-                    dists.append(np.nanmean(np.sqrt(dx ** 2 + dy ** 2)))
-        dists = [d for d in dists if np.isfinite(d)]
-        if dists:
-            r = float(np.nanmean(dists))
-            log(f"Derived baseline (mean hub->ring distance): {r:.4f}")
-        else:
-            r = 1.0
-            log("WARNING: cannot derive baseline (too few detected nodes); using r=1.0. "
-                "Pass --baseline for a meaningful template radius. (Radius does not affect "
-                "the fitted body angle.)")
-
-    template = {hub: (0.0, 0.0)}
-    m = len(ring)
-    for k, n in enumerate(ring):
-        theta = 2.0 * np.pi * k / m
-        template[n] = (r * np.cos(theta), r * np.sin(theta))
-    log(f"Regular-polygon template: hub={hub}, ring={ring}, radius={r:.4f} "
-        f"(radius does not affect the fitted angle).")
-    return template
 
 
 def mean_shape_template(nodes, xw, yw):
@@ -415,6 +366,9 @@ def parse_args():
     p.add_argument("--baseline", type=float, default=None,
                    help="Node-to-node distance for the template. If omitted, derived from data. "
                         "(Only sets the template radius; does not affect the fitted body_angle.)")
+    p.add_argument("--topology", type=str, default="auto",
+                   help="Reference topology for the body-angle template: 'auto' (by node count: "
+                        "7=hub_spoke, 6=ring), or an explicit name from robot_topology.py.")
     p.add_argument("--fps", type=float, default=None,
                    help="Override fps (else read from the raw-CSV header, else 30).")
     p.add_argument("--output", type=str, default=None, help="Output CSV. Default: <raw>_robot.csv")
@@ -430,6 +384,7 @@ def main():
 
     connections = ast.literal_eval(args.connections)
     connections = [tuple(c) for c in connections]
+    using_default_connections = (args.connections == repr(DEFAULT_CONNECTIONS))
 
     raw = read_csv_comments(args.raw_csv)
     meta = raw.attrs
@@ -458,6 +413,14 @@ def main():
     if missing_nodes:
         log(f"WARNING: node(s) never detected in any frame: {missing_nodes} "
             f"(their columns will be NaN).")
+        if using_default_connections:
+            log("!" * 70)
+            log(f"NOTE: --connections was not given, so the DEFAULT 7-node hub-and-spoke is in "
+                f"use. The node set (hence N_nodes and topology) comes from --connections, NOT "
+                f"from the detected tags {detected}. If this is a different lattice, pass "
+                f"--connections for it (e.g. a 6-ring: "
+                f"\"[(1,2),(2,3),(3,4),(4,5),(5,6),(6,1)]\").")
+            log("!" * 70)
 
     # Interpolate, then pivot to per-frame arrays.
     interp = interpolate_tracks(raw, total_frames, log)
@@ -502,9 +465,17 @@ def main():
                    if cid in xw.columns else (np.nan, np.nan) for cid in corner_ids]
 
     # --- Template for absolute body angle --------------------------------- #
-    template = build_template(nodes, connections, args.baseline, xw, yw, log)
+    # Idealized per-topology reference (repeatable across experiments; a flexible robot's
+    # mean shape is not). Radius is irrelevant to the body angle (Kabsch is scale-invariant).
+    template, topology = reference_template(nodes, connections, args.topology,
+                                            radius=(args.baseline or 1.0))
     if template is None:
+        log(f"WARNING: no built-in template for topology '{topology}' ({len(nodes)} nodes); "
+            f"falling back to the (non-repeatable) mean shape. Add it to robot_topology.py.")
         template = mean_shape_template(nodes, xw, yw)
+    else:
+        log(f"Reference template: topology={topology} "
+            f"(radius does not affect the body angle).")
     tmpl_nodes = [n for n in nodes if n in template]
     tmpl_pts = np.array([template[n] for n in tmpl_nodes])
 
@@ -609,6 +580,7 @@ def main():
         "frame": frame_label,
         "fps": fps,
         "heading_source": heading_source,
+        "topology": topology,
     }
     if sensor is not None:
         attrs["sensor_angle_units"] = args.sensor_angle_units
