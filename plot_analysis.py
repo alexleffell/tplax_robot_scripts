@@ -27,6 +27,10 @@ output directory. Figures:
  20. Pairwise heading angular-velocity correlation heatmap
  21. Heading kymograph over the ring (time x node, hue = caster angle)
  22. Interior bond-angle (/_ABC) deviation kymograph (time x node)
+ 23. Banded modal energy (degenerate groups)
+ 24. Drive overlap vs response, by mode band
+ 25. Drive-field vs mode-shape overlay (top non-rigid modes)
+ 26. Modal energy vs time (per-mode KE all / KE rigid-removed / PE, stacked panels)
 
 Every figure is footer-stamped and filename-tagged with the heading source and angle frame.
 
@@ -489,6 +493,32 @@ def main():
                      f"vs mode shape (blue)")
         fig.tight_layout(rect=(0, 0, 1, 0.96))
         save(fig, "25_drive_mode_overlap.png")
+
+    # 26. Modal energy vs time (three stacked panels): per-mode KE (all modes), per-mode KE
+    #     with rigid-body modes removed, and per-mode PE. Lets you watch how energy is
+    #     distributed across modes (and the rigid-body share) evolve over time.
+    if "vel" in d.files and "eigenvectors" in d.files and "modal_KE" in d.files:
+        evecs = d["eigenvectors"]
+        twoN = evecs.shape[0]
+        Vf = np.asarray(d["vel"]).reshape(len(time), -1)
+        ke_all = 0.5 * (Vf @ evecs) ** 2                     # (T, 2N) full-velocity modal KE
+        ke_def = np.asarray(d["modal_KE"])                   # (T, 2N) rigid-removed modal KE
+        pe = 0.5 * np.asarray(d["eigenvalues"])[None, :] * np.asarray(d["modal_disp"]) ** 2
+        rigid_set = set(int(i) for i in d["rigid_idx"]) if "rigid_idx" in d.files else set()
+        colors = plt.cm.tab20(np.linspace(0, 1, twoN))
+        labels = [f"mode {i}" + (" (rigid)" if i in rigid_set else "") for i in range(twoN)]
+        fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+        panels = [(axes[0], ke_all, "Modal KE (all modes)"),
+                  (axes[1], ke_def, "Modal KE (rigid-body modes removed)"),
+                  (axes[2], pe, "Modal PE")]
+        for ax, data, ttl in panels:
+            # Stacked area (bands = per-mode energy); total = top envelope, band thickness = share.
+            ax.stackplot(time, np.clip(data, 0, None).T, colors=colors, labels=labels)
+            ax.set_ylabel("energy"); ax.set_title(ttl); ax.margins(x=0, y=0)
+        axes[2].set_xlabel("time")
+        axes[0].legend(fontsize=6, ncol=2, loc="upper right")
+        fig.tight_layout()
+        save(fig, "26_modal_energy_vs_time.png")
 
     print(f"\nWrote {len(saved)} figures to {outdir}/")
 

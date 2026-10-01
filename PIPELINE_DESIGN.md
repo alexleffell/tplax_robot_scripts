@@ -26,6 +26,16 @@ does detection + pose only (raw, camera frame); **script 3** does geometry/bookk
 and stores them; **script 5** only reads the bundle and draws. Calculations never live
 in the plotter and plotting never lives in the analysis script.
 
+A parallel **single-node** path uses the same tracker. One video can hold several
+trajectories (the tag is covered by hand between resets); `format_tracks_single.py`
+splits on long dropouts, then `plot_analysis_single.py` draws (no modal analysis yet).
+
+```
+<video>_raw.csv ─► format_tracks_single.py ─► <core>_robot.csv (+ .log)   (wide, per-track, + track column)
+                                                      │
+<core>_robot.csv ─► plot_analysis_single.py ─► <core>_robot_plots/*.png
+```
+
 ## Global conventions & environment
 
 - **Detector**: `pupil_apriltags`, family `tag16h5` (matches the physical printed tags).
@@ -219,6 +229,48 @@ a superset, so scripts 4–5 need no changes).
 
 ---
 
+# 3b. `format_tracks_single.py`
+
+**Purpose.** Same role as `format_tracks.py` for a **one-node** robot whose video contains
+several trajectories. The operator covers the AprilTag with a hand while resetting the node
+and uncovers it before the next run. Input is the raw CSV from `apriltag_tracker.py`.
+
+**Design choices**
+- **Node id** = `--node-id` if given, else the unique detected non-corner tag. Multiple
+  non-corner tags is an error (pass `--node-id`). Corner / other tags remain `extra_tag_<id>`.
+- **Split on long dropouts**, not on pose jumps: a new track starts when the node is missing
+  for `>= --min-gap-seconds` (default 0.5 s; `--min-gap-frames` overrides). Brief tracking
+  glitches (1–3 frames) stay inside a track. Hand-cover gaps are **omitted** from the output
+  (not interpolated across). Tracks shorter than `--min-track-seconds` (default 0.25 s) are
+  dropped. The log prints a gap histogram so the threshold can be retuned.
+- **Interpolation only inside a track**, on the frame grid from first to last detection of
+  that track. Positions: linear. Angle: unwrap → interpolate → re-wrap, so fills do not jump
+  across ±π.
+- **Lab frame** reuses `format_tracks.py`'s corner-tag similarity transform (and the
+  `--camera-frame` / missing-corner fallback). Extra tags are interpolated over the whole
+  video so corners that stay visible during a hand-cover still define the transform.
+- **Output** matches `format_tracks.py` column order, with `track` (1-indexed) after `time`.
+  For one node the heading *is* the body orientation: `body_angle` = `{id}_theta` = lab (or
+  camera) tag angle; `{id}_angle` = 0; centroid = node position; `body_angle_incremental`
+  resets to 0 at each track start. Header adds `topology: single`, `n_tracks`,
+  `min_gap_frames`, `node_id`. No sensor merge (tag heading only).
+
+## Per-calculation details
+
+- **Track boundaries**: sorted unique detection frames `f_i`; split where
+  `f_{i+1} − f_i − 1 >= min_gap_frames`.
+- **`{id}_theta` / `body_angle`**: tag in-plane angle, plus the lab-transform rotation when
+  the lab frame is used.
+- **`body_angle_incremental`**: unwrapped heading minus the track's first-frame heading.
+
+**Assumptions**
+- The tag is actually lost during a hand-cover. If the detector still reports the tag
+  (through the hand), gap-splitting will not cut trajectories — lower the gap threshold or
+  split on pose quality instead.
+- Linear in-track interpolation is acceptable for the short dropouts that remain.
+
+---
+
 # 4. `analyze_modes.py`
 
 **Purpose.** Compute all physical quantities for a polar active solid and store them in one
@@ -236,6 +288,15 @@ a superset, so scripts 4–5 need no changes).
   preference; radius is derived from the mean hub→ring distance when `--baseline` is omitted.
 - **Spring parameters**: global `--k` and `--l0`. `--l0 = None` means each bond is relaxed at
   its own equilibrium length (zero pre-tension).
+- **Bending stiffness** (`--kappa`, default 0 = off): harmonic bond-bending springs about the
+  ideal reference angles (all bond-pairs at each node; for a ring, the interior angles). The
+  Hessian contribution is the exact `κ·Σ(∇θ)(∇θ)ᵀ` at the reference (the bending minimum, so no
+  pre-stress term); `∇θ` is a cached finite-difference of the interior angle. Bending is
+  rigid-body invariant, so it **lifts the floppy mechanism modes to finite frequency (λ ~ κ/L²)
+  while leaving the 3 rigid modes at zero** — which also collapses the λ≈0 block to 3 (rigid
+  only), removing the rigid/mechanism degeneracy. `--kappa 0` reproduces the central-force
+  model exactly. The λ are in `k=1`/unit-mass units, so calibrate `κ/(k·L²)` (e.g. match the
+  lifted mechanism frequency to the observed floppy-shear oscillation).
 - **Unit mass** throughout (`KE = ½Σ|v|²`); velocities from finite differences of node
   positions at `dt = 1/fps`.
 - **"Zero modes" = the 3 rigid-body modes** (2 translations + 1 rotation). Their KE is kept for
@@ -262,8 +323,11 @@ a superset, so scripts 4–5 need no changes).
 
 - **Elastic Hessian & normal modes** — central-force spring stiffness at the reference config:
   each bond contributes `k·n̂n̂ᵀ` longitudinally plus `(t/L)(I − n̂n̂ᵀ)` transversely, where
-  `t = k(L − l0)` is the equilibrium tension. Eigen-decomposition gives eigenvalues (= ω²,
-  unit mass) and orthonormal eigenvectors (modes), ordered ascending.
+  `t = k(L − l0)` is the equilibrium tension. With `--kappa > 0`, harmonic bond-bending springs
+  add `κ·Σ(∇θ)(∇θ)ᵀ` (see the foundational bullet). Eigen-decomposition gives eigenvalues
+  (= ω², unit mass) and orthonormal eigenvectors (modes), ordered ascending. The λ≈0 block is
+  then cleanly split into rigid (3) + mechanism modes via the analytic rigid-body subspace, so
+  every downstream projection is effectively rigid-frame and "zero modes" means the mechanisms.
 
 - **Node-velocity modal projection** — done with **rigid-body motion removed** (the
   deformation spectrum), per the requirement. Rigid removal uses the mechanics decomposition
@@ -386,6 +450,25 @@ velocity correlation heatmap  20. Pairwise heading angular-velocity correlation 
 
 ---
 
+# 5b. `plot_analysis_single.py`
+
+**Purpose.** Read the formatted CSV from `format_tracks_single.py` and render diagnostic
+figures. Contains **no calculations** beyond wrapping/unwrapping already-stored heading for
+display. More figures will be added later.
+
+**Design choices**
+- Matplotlib `Agg`, default outdir `<csv>_plots/`, configurable DPI — same pattern as
+  `plot_analysis.py`.
+- Footer stamps heading source, frame (lab|camera), and node id.
+- Tracks are **not** connected to each other.
+
+**Figures**
+1. Phase portrait of heading vs y, all tracks overlaid. Heading is wrapped to
+   \([-\pi, \pi]\) (branch-cut segments dropped). Square = track start; arrow = track end
+   (oriented along the path in display space). One color per track.
+
+---
+
 # Running the pipeline
 
 Environment: `/opt/miniconda3/envs/tplax_env/bin/python` (cv2 4.10, pupil_apriltags, scipy).
@@ -428,6 +511,16 @@ Per-experiment knobs to remember:
 - Tag family/sizes (step 2) default to `tag16h5` / 0.045 m / 0.037 m — override per dataset.
 
 Steps 3→4→5 are re-run while iterating on analysis; steps 1–2 are done once per camera/video.
+
+Single-node (after the same tracker step; no `analyze_modes.py`):
+
+```bash
+$PY format_tracks_single.py ../Data/180826/_2026-08-18_15_27_42_802_raw.csv
+#   -> ..._robot.csv (+ ..._robot.log); retune --min-gap-seconds from the gap histogram in the log
+
+$PY plot_analysis_single.py ../Data/180826/_2026-08-18_15_27_42_802_robot.csv
+#   -> ..._robot_plots/01_phase_portrait_y_heading.png
+```
 
 ---
 
@@ -491,6 +584,22 @@ arguments are required; all `--flags` are optional with the defaults shown.
 | `--output` | `<raw>_robot.csv` | Output wide CSV path. |
 | `--log` | `<raw>_robot.log` | Text log path (stats + warnings). |
 
+## `format_tracks_single.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `raw_csv` (positional) | — | Raw CSV from `apriltag_tracker.py`. |
+| `--node-id` | unique non-corner detected tag | Robot tag id. |
+| `--corner-ids` | raw-CSV header, else `26 27 28 29` | Corner tag ids used to build the lab frame. |
+| `--arena-size W H` | observed corner spacing | Real lab-rectangle dimensions for the lab transform. |
+| `--camera-frame` | off | Skip the corner-tag lab transform; keep camera-frame positions. |
+| `--min-gap-seconds` | `0.5` | Dropout this long (or longer) starts a new trajectory. Ignored if `--min-gap-frames` is given. |
+| `--min-gap-frames` | from `--min-gap-seconds` | Dropout length in frames that starts a new trajectory. |
+| `--min-track-seconds` | `0.25` | Drop trajectories shorter than this. |
+| `--fps` | raw-CSV header, else 30 | Override the frame rate. |
+| `--output` | `<raw>_robot.csv` | Output wide CSV path. |
+| `--log` | `<raw>_robot.log` | Text log path (stats + warnings). |
+
 ## `analyze_modes.py`
 
 | Argument | Default | Description |
@@ -498,6 +607,7 @@ arguments are required; all `--flags` are optional with the defaults shown.
 | `robot_csv` (positional) | — | Formatted CSV from `format_tracks.py`. |
 | `--k` | `1.0` | Uniform spring constant. |
 | `--l0` | each bond's equilibrium length | Uniform spring rest length; omit for a relaxed network (no pre-tension). |
+| `--kappa` | `0` (off) | Bond-bending stiffness (harmonic angle springs about the ideal reference angles). Lifts floppy mechanism modes to finite frequency; rigid modes stay at zero. |
 | `--baseline` | CSV header, else derived | Template radius (m); else the mean observed spring length. |
 | `--topology` | `auto` (from CSV header / node count) | Reference topology for the Hessian + body frame (`robot_topology.py`). |
 | `--angle-frame` | `lab` | Caster-angle frame for order parameter/projections/diffusion: `lab` uses `{n}_theta`, `body` uses `{n}_angle`. |
@@ -518,6 +628,14 @@ arguments are required; all `--flags` are optional with the defaults shown.
 | `--outdir` | `<npz>_plots/` | Output directory for the figures. |
 | `--dpi` | `130` | Figure DPI. |
 | `--n-modes` | `4` | Number of deformation mode shapes to draw. |
+
+## `plot_analysis_single.py`
+
+| Argument | Default | Description |
+|---|---|---|
+| `robot_csv` (positional) | — | Formatted CSV from `format_tracks_single.py`. |
+| `--outdir` | `<csv>_plots/` | Output directory for the figures. |
+| `--dpi` | `130` | Figure DPI. |
 
 ---
 
@@ -542,3 +660,6 @@ arguments are required; all `--flags` are optional with the defaults shown.
   heading and (correctly) does not correlate with the encoder; the encoder is the heading source
   and per-node hardware zeros are "roughly aligned but noisy", so cross-node angle statistics
   inherit that per-node zero noise.
+- **Single-node track splitting** only sees lost detections. If the tag is still decoded
+  during a hand-cover, the gap never exceeds `--min-gap-seconds` and the video stays one
+  track; check the gap histogram in the `format_tracks_single.py` log.

@@ -100,12 +100,55 @@ def build_reference(nodes, connections, baseline, topology, X, Y, log):
 # --------------------------------------------------------------------------- #
 # Spring-network Hessian (2N x 2N), unit mass
 # --------------------------------------------------------------------------- #
-def build_hessian(nodes, connections, ref, k, l0):
-    """Small-oscillation stiffness matrix for central-force springs.
+def _hinges(nodes, connections):
+    """Bending hinges (iA, iB, iC) as node column indices: for every node B, all pairs of
+    its incident bonds. For a ring each node has exactly one hinge (its interior angle)."""
+    idx = {n: i for i, n in enumerate(nodes)}
+    adj = {i: set() for i in range(len(nodes))}
+    for a, b in connections:
+        adj[idx[a]].add(idx[b]); adj[idx[b]].add(idx[a])
+    hinges = []
+    for b, nbrs in adj.items():
+        nb = sorted(nbrs)
+        for i in range(len(nb)):
+            for j in range(i + 1, len(nb)):
+                hinges.append((nb[i], b, nb[j]))
+    return hinges
+
+
+def _angle(x, iA, iB, iC):
+    """Interior angle /_ABC (rad) from flat coords x=[x0,y0,x1,y1,...]."""
+    u = x[2 * iA:2 * iA + 2] - x[2 * iB:2 * iB + 2]
+    v = x[2 * iC:2 * iC + 2] - x[2 * iB:2 * iB + 2]
+    return np.arctan2(abs(u[0] * v[1] - u[1] * v[0]), u[0] * v[0] + u[1] * v[1])
+
+
+def bending_hessian(ref_arr, hinges, kappa, hstep=1e-6):
+    """Harmonic bond-bending contribution kappa * sum_h (grad theta_h)(grad theta_h)^T,
+    evaluated at the reference (the ideal-angle minimum, so this is exact -- no pre-stress
+    term). grad theta is obtained by central finite differences (computed once, then cached)."""
+    two_n = 2 * len(ref_arr)
+    x0 = ref_arr.reshape(-1)
+    H = np.zeros((two_n, two_n))
+    for (iA, iB, iC) in hinges:
+        g = np.zeros(two_n)
+        for c in (2 * iA, 2 * iA + 1, 2 * iB, 2 * iB + 1, 2 * iC, 2 * iC + 1):
+            xp = x0.copy(); xp[c] += hstep
+            xm = x0.copy(); xm[c] -= hstep
+            g[c] = (_angle(xp, iA, iB, iC) - _angle(xm, iA, iB, iC)) / (2 * hstep)
+        H += kappa * np.outer(g, g)
+    return H
+
+
+def build_hessian(nodes, connections, ref, k, l0, kappa=0.0):
+    """Small-oscillation stiffness matrix for central-force springs (+ optional bending).
 
     Each bond contributes k * (n n^T) longitudinally plus (t/L)(I - n n^T)
     transversely, where t = k (L - l0) is the equilibrium tension and L the
     equilibrium bond length. With l0 == L the bond is relaxed (longitudinal only).
+    With kappa > 0, harmonic bond-bending springs about the reference (ideal) angles are
+    added; these lift the floppy mechanism modes to finite frequency but leave the rigid-body
+    modes at zero (bending is rigid-body invariant).
     """
     idx = {n: i for i, n in enumerate(nodes)}
     N = len(nodes)
@@ -124,6 +167,9 @@ def build_hessian(nodes, connections, ref, k, l0):
         kb = k * nn + (t / L) * (np.eye(2) - nn)
         for (p, q, s) in [(ia, ia, +1), (ib, ib, +1), (ia, ib, -1), (ib, ia, -1)]:
             K[2 * p:2 * p + 2, 2 * q:2 * q + 2] += s * kb
+    if kappa and kappa > 0:
+        ref_arr = np.array([ref[n] for n in nodes], dtype=float)
+        K = K + bending_hessian(ref_arr, _hinges(nodes, connections), kappa)
     K = 0.5 * (K + K.T)  # symmetrize against round-off
     return K
 
@@ -189,24 +235,27 @@ def _canon_connections(connections):
     return sorted(tuple(sorted(c)) for c in connections)
 
 
-def lattice_signature(nodes, connections, k, l0, radius):
-    """Stable hash of the lattice. Eigenvectors of a relaxed regular lattice are
-    radius-independent, so radius enters only when a rest length (tension) is set."""
+def lattice_signature(nodes, connections, k, l0, radius, kappa=0.0):
+    """Stable hash of the lattice. Eigenvectors of a relaxed, bending-free regular lattice are
+    radius-independent; radius enters only when a rest length (tension) or bending is set
+    (bending/stretching weighting is scale-dependent)."""
     parts = {
         "nodes": list(nodes),
         "connections": _canon_connections(connections),
         "k": round(float(k), 8),
         "l0": None if l0 is None else round(float(l0), 8),
+        "kappa": round(float(kappa), 8),
     }
-    if l0 is not None:
+    if l0 is not None or (kappa and kappa > 0):
         parts["radius"] = round(float(radius), 4)
     return hashlib.md5(repr(parts).encode()).hexdigest()[:12]
 
 
-def load_or_build_modes(K, nodes, connections, k, l0, radius, ref_arr, modes_dir, recompute, log):
+def load_or_build_modes(K, nodes, connections, k, l0, radius, ref_arr, modes_dir, recompute, log,
+                        kappa=0.0):
     """Return (eigenvalues, eigenvectors, source). Cached in modes_dir keyed by lattice."""
     os.makedirs(modes_dir, exist_ok=True)
-    sig = lattice_signature(nodes, connections, k, l0, radius)
+    sig = lattice_signature(nodes, connections, k, l0, radius, kappa)
     path = os.path.join(modes_dir, f"modes_{sig}.npz")
     canon = _canon_connections(connections)
 
@@ -313,6 +362,10 @@ def parse_args():
     p.add_argument("--l0", type=float, default=None,
                    help="Spring rest length (uniform). Default: each bond's equilibrium length "
                         "(relaxed network, no pre-tension).")
+    p.add_argument("--kappa", type=float, default=0.0,
+                   help="Bond-bending stiffness (harmonic angle springs about the ideal reference "
+                        "angles). Default 0 (no bending). kappa>0 lifts floppy mechanism modes to "
+                        "finite frequency while keeping rigid-body modes at zero.")
     p.add_argument("--baseline", type=float, default=None,
                    help="Template radius. Default: from CSV header, else derived from data.")
     p.add_argument("--topology", type=str, default="auto",
@@ -417,10 +470,10 @@ def main():
     radius = float(np.mean(np.linalg.norm(ref_arr - ref_arr.mean(axis=0), axis=1)))
     l0 = args.l0
     # l0 is None -> each bond relaxed at its own equilibrium length (no pre-tension).
-    K = build_hessian(nodes, connections, ref, args.k, l0)
+    K = build_hessian(nodes, connections, ref, args.k, l0, args.kappa)
     evals, evecs, modes_source = load_or_build_modes(
         K, nodes, connections, args.k, l0, radius, ref_arr,
-        args.modes_dir, args.recompute_modes, log)
+        args.modes_dir, args.recompute_modes, log, kappa=args.kappa)
     n_zero_numeric = int(np.sum(np.abs(evals) < args.zero_mode_tol))
     # Cleanly split the lambda~0 block into rigid + mechanism (the [0,1,2]=rigid assumption
     # is wrong for a floppy lattice, where rigid and mechanism modes are degenerate and mixed).
