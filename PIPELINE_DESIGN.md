@@ -273,146 +273,94 @@ and uncovers it before the next run. Input is the raw CSV from `apriltag_tracker
 
 # 4. `analyze_modes.py`
 
-**Purpose.** Compute all physical quantities for a polar active solid and store them in one
-`.npz` bundle (plus a `.txt` summary with sanity checks). All heavy physics lives here.
+**Purpose.** Modal and kinematic analysis of a **ring** robot (relaxed springs, no
+pre-stress), stored in one `.npz` bundle plus a `.txt` summary with checks.
 
 ## Foundational choices
 
-- **Normal modes = passive elastic modes** (Hermitian spring Hessian), eigen-decomposed.
-  This is the basis Baconnier–Dauchot project onto for "collective actuation"; the
-  non-normality that *selects* a mode lives in the coupled position+polarity stability
-  operator, which is not needed to *measure* the dynamics. Documented caveat: "normal mode"
-  here means the passive one.
-- **Reference (equilibrium) configuration** = the regular-polygon template built from
-  `--baseline` (or data-derived if absent). Chosen over the mean-observed shape by user
-  preference; radius is derived from the mean hub→ring distance when `--baseline` is omitted.
-- **Spring parameters**: global `--k` and `--l0`. `--l0 = None` means each bond is relaxed at
-  its own equilibrium length (zero pre-tension).
-- **Bending stiffness** (`--kappa`, default 0 = off): harmonic bond-bending springs about the
-  ideal reference angles (all bond-pairs at each node; for a ring, the interior angles). The
-  Hessian contribution is the exact `κ·Σ(∇θ)(∇θ)ᵀ` at the reference (the bending minimum, so no
-  pre-stress term); `∇θ` is a cached finite-difference of the interior angle. Bending is
-  rigid-body invariant, so it **lifts the floppy mechanism modes to finite frequency (λ ~ κ/L²)
-  while leaving the 3 rigid modes at zero** — which also collapses the λ≈0 block to 3 (rigid
-  only), removing the rigid/mechanism degeneracy. `--kappa 0` reproduces the central-force
-  model exactly. The λ are in `k=1`/unit-mass units, so calibrate `κ/(k·L²)` (e.g. match the
-  lifted mechanism frequency to the observed floppy-shear oscillation).
-- **Unit mass** throughout (`KE = ½Σ|v|²`); velocities from finite differences of node
-  positions at `dt = 1/fps`.
-- **"Zero modes" = the 3 rigid-body modes** (2 translations + 1 rotation). Their KE is kept for
-  the ratio; the deformation spectrum is computed after removing rigid-body motion.
-- **Shared, cached normal modes.** Modes are loaded from
-  `/Users/alexleffell/Documents/PhD/tplax/tplax_paper` (`--modes-dir`) keyed by a lattice
-  signature (nodes + canonicalized connections + `k` + `l0`, plus radius only when `l0`
-  introduces tension — relaxed-lattice eigenvectors are radius-independent). On a hit, the
-  stored eigenvalues/eigenvectors are reused verbatim so **ordering and sign are identical
-  across every experiment on the same lattice**; on a miss they are computed with a canonical
-  sign convention (largest-magnitude component positive) and written there. This is the fix for
-  the fact that `eigh` is not guaranteed repeatable — especially across degenerate subspaces
-  (e.g. the hexagon's degenerate λ pair), which are only defined up to rotation within the
-  subspace until pinned by the cache.
-- **Caster-angle frame** selectable via `--angle-frame {lab,body}` (default `lab`, using
-  `{n}_theta`; `body` uses `{n}_angle` with rigid rotation removed). Affects the order
-  parameter, both angle projections, and the diffusion coefficient. Default is lab because the
-  raw tracker measures lab-frame caster orientation; body frame is offered because it removes
-  the robot's rigid rotation from the intrinsic caster dynamics.
+- **Model**: N nodes on a regular ring (template from `robot_topology.py`, counter-clockwise in
+  connection-cycle order), relaxed central-force springs `k n̂n̂ᵀ` per bond (no tension term — the
+  reference is an exact equilibrium, so the Hessian is the exact small-deformation operator),
+  optional harmonic bond bending `--kappa` about the ideal interior angle (Hessian
+  `κ Σ ∇θ∇θᵀ`). Unit mass. `k = 1` and unit mass are arbitrary: KE and PE are in different
+  units and are **not summed** (no total energy, no effective temperature / equipartition —
+  the system is driven and dissipative).
+- **Body frame for every modal projection.** Mode shapes are defined on the template (node k at
+  angle 2πk/N). Each frame the best-fit rotation β(t) (closed-form 2-D Kabsch, template →
+  observed) is removed before projecting displacements (`Q`), deformation velocities (`A`) and
+  polarities (`C`). (Before this fix, lab-frame vectors were projected onto body-frame modes,
+  which mixes radial and tangential components by sin β and invalidated band/condensation
+  results; the harmonic-PE check had been failing at 0.5–388 on every run.)
+- **Rigid / mechanism split.** The λ≈0 block is re-based into 3 analytic rigid modes + the
+  mechanisms (3 for a 6-ring with κ = 0; lifted to finite λ when κ > 0).
+- **Symmetry-adapted sectors.** The ring is invariant under the one-node rotation S
+  (`(S q)_{k+1} = R(2π/N) q_k`), which commutes with the Hessian (checked, logged). Inside each
+  degenerate band the eigenvectors are re-based by the real Schur form of S into sectors:
+  2-D sectors (S acts as a rotation by φ = 2πm/N, 0 < φ < π; pair oriented so that a pattern
+  travelling counter-clockwise in the body frame turns z = Q₁ + iQ₂ counter-clockwise) and 1-D
+  sectors (m = 0 or N/2). Sector identities (m) do not depend on k or κ; κ only sets their λ and
+  the radial/tangential mix within a sector. For a 6-ring with κ = 0: soft band = m=2 shear
+  pair + m=3 mechanism; stiff sectors m=0 (breathing), m=1, m=2, m=3.
+- **Mode cache** in `--modes-dir` keyed by nodes, connections, k, κ (+ radius when κ > 0), and
+  checked against the stored reference shape; the cache holds raw `eigh` output and the rigid
+  split / symmetry adaptation is applied after loading.
+- **Heading frame** `--angle-frame {lab,body}` affects only the order parameter, kymographs,
+  autocorrelations, diffusion and bond alignment; modal projections always use body-frame
+  polarity `(cos(γ−β), sin(γ−β))`.
 
 ## Per-calculation details
 
-- **Center-of-mass trajectory** — directly from the `centroid_x/y` columns.
+- **Strain-wave order parameter** (the condensation measure for a driven ring). For each 2-D
+  sector j with complex amplitude z_j = Q_{j,1} + iQ_{j,2} (body-frame displacements):
+  `share_j(t) = |z_j|²/Σ_deform Q²` (fraction of the deformation in the sector),
+  `circ_j(t) = Im(z̄ż)/(|z||ż|)` (+1 CCW travelling wave, −1 CW, 0 standing/noise),
+  `Λ_j = ⟨Im z̄ż⟩/⟨|z||ż|⟩`, phase speed `Ω_j = ⟨Im z̄ż⟩/⟨|z|²⟩` (the pattern turns at Ω_j/m in
+  the body frame), amplitude CV, and `W_j(t) = share_j·circ_j`; `W_win` uses `--wave-window`
+  averages of numerator and denominator. The dominant sector is the 2-D sector with the largest
+  mean share; `wave_order = share·Λ` (signed), `wave_order_abs = ⟨|W_win|⟩` (direction-blind,
+  for runs that switch direction). A strain-wave limit cycle gives |W| → 1 (e.g. chiral_1_trim:
+  m = 2, share 0.93, Λ = −0.975, W = −0.91, robust to κ = 0 vs 0.005).
+- **Sector participation ratio** `1/Σ_j share_j²` — λ- and basis-independent condensation
+  measure (per-mode PR and the banded PR are kept for comparison; per-mode PR is arbitrary
+  inside degenerate bands).
+- **Rigid-body KE fraction** — CoM translation + least-squares rotation about the instantaneous
+  centroid, removed orthogonally; rotation-invariant.
+- **Potential energy** — springs `½k(L − L_ref)²` + bending `½κ(θ − θ_ref)²` (ring interior
+  angles), `PE_total = PE_spring + PE_bend`.
+- **Order parameter** — polar `|⟨e^{iγ}⟩|` (or `--nematic`), reported with the finite-N
+  random-heading baseline `order_param_null` (≈0.37 for N = 6).
+- **Heading field on the Laplacian** — complex field e^{iγ} projected on the graph-Laplacian
+  modes; the uniform-mode fraction equals (polar order)². (Raw wrapped angles were previously
+  projected, which is gauge-dependent.)
+- **Polarity overlap with the soft band** (`elastic_zero_ratio`) — body-frame polarity power in
+  the lowest non-rigid band (the mechanisms when κ = 0). Previously identically 0 for κ > 0.
+- **Rotational diffusion** — per-node heading MSD after removing that node's mean spin
+  (least-squares slope), `D_r = slope/2`; `spin_per_node` stores the spin rates. (A raw MSD of a
+  spinning caster is ballistic and gives no diffusion coefficient.)
+- **Orientational autocorrelation / integral time** — for spinning headings ≈ 1/ω (a
+  decorrelation-by-rotation time). **VACF**, **velocity / γ̇ correlation matrices**, **bond
+  alignment**, **ring winding** (ring order from the connection cycle), **kymographs** (heading;
+  interior-angle deviation from 180(N−2)/N), **CoM PDF** — lab frame, unchanged.
+- **Polarity–velocity coupling / actuation spectrum** — kept, but with no-slip wheels the node
+  velocity is slaved to the heading, so values near 1 are kinematic; departures measure caster
+  swing (l·γ̇) and slip, not elastic mode selection.
+- **PSDs** — order parameter, KE, PE, per-node γ̇, and modal **amplitudes** Q (an energy PSD
+  shows a mode oscillating at f at 2f).
+- **Gap interpolation** — positions linearly; angles on the unwrapped series.
 
-- **Elastic Hessian & normal modes** — central-force spring stiffness at the reference config:
-  each bond contributes `k·n̂n̂ᵀ` longitudinally plus `(t/L)(I − n̂n̂ᵀ)` transversely, where
-  `t = k(L − l0)` is the equilibrium tension. With `--kappa > 0`, harmonic bond-bending springs
-  add `κ·Σ(∇θ)(∇θ)ᵀ` (see the foundational bullet). Eigen-decomposition gives eigenvalues
-  (= ω², unit mass) and orthonormal eigenvectors (modes), ordered ascending. The λ≈0 block is
-  then cleanly split into rigid (3) + mechanism modes via the analytic rigid-body subspace, so
-  every downstream projection is effectively rigid-frame and "zero modes" means the mechanisms.
+### Checks (printed to the summary)
 
-- **Node-velocity modal projection** — done with **rigid-body motion removed** (the
-  deformation spectrum), per the requirement. Rigid removal uses the mechanics decomposition
-  (subtract CoM velocity + best-fit angular velocity ω from `Σ r×v / Σ|r|²`), which is
-  orthogonal (`v = v_rigid ⊕ v_def`). Modal amplitudes `A = v_def·U`; modal energies `½A²`.
+- **Harmonic PE** `½Σλ_iQ_i²` vs spring+bending PE, `median|Δ| / mean PE` — ≪ 1 when the
+  deformation sits in stiff modes; with κ = 0 a large-amplitude mechanism stretches springs at
+  second order (≈0.5 on chiral_1_trim), which the harmonic model correctly misses.
+- **Rigid leakage** of deformation KE into rigid modes — small; grows with deformation amplitude
+  because rigid motion is removed in the current (deformed) shape.
+- **Ring symmetry** `‖SK − KS‖/‖K‖` (≈1e-16 for κ = 0, ≈1e-11 with the finite-difference
+  bending Hessian).
 
-- **Zero-mode KE ratio** — `KE_zero / KE_total` with `KE_zero = KE_total − KE_deform` using the
-  orthogonal split. Numerator is the rigid-body KE (zero modes kept, per the requirement);
-  denominator is total KE. This measures how rigid-body-like the motion is.
-
-- **Caster-angle projection, two bases** (per request):
-  - **Graph-Laplacian**: project the angle vector `θ` (N scalars) onto the network Laplacian
-    eigenvectors; the zero mode is the uniform field, tying the zero-mode fraction to global
-    alignment. Zero-mode ratio = energy in Laplacian null space / `|θ|²`.
-  - **Elastic modes**: embed the caster field as a polarity vector `p = (cosθ, sinθ)` (a 2N
-    vector in the same space as velocity) and project onto the elastic eigenvectors. This
-    measures how the active driving overlaps each mechanical mode; the zero-mode (rigid)
-    fraction = how rigid-body-like the driving is.
-
-- **Spring potential energy** — per spring `½k(L − l0)²` (rest length = `l0`, or the per-bond
-  reference length when `l0=None`); summed to `PE_total`.
-
-- **Total energy** — `E = KE_total + PE_total`. (Noted: not conserved — motors inject energy,
-  friction dissipates — so `E` is an observable, not an invariant.)
-
-- **Orientation order parameter** — **polar** `Ψ = |⟨e^{iθ}⟩|` by default (matches the
-  notebook's magnetization); `--nematic` switches to `|⟨e^{2iθ}⟩|`. Rotation-invariant, so the
-  angle-frame choice does not change it.
-
-- **Caster-angle diffusion `D_r`** — from the linear regime of the per-caster unwrapped-angle
-  MSD, `D_r = slope/2`, reported per node and mean. (In the lab frame this is contaminated by
-  the body's rigid rotation; use `--angle-frame body` for the intrinsic caster diffusion.)
-
-- **CoM 2D histogram / PDF** — normalized 2D histogram of the centroid in the (lab) arena
-  frame, `--bins` per axis.
-
-- **PSDs** — Welch (`scipy.signal.welch`, fps sampling) of the order parameter, KE, PE, and
-  each modal energy time series.
-
-### Active-solid diagnostics (added for polar active solids)
-
-- **Polarity–velocity coupling** — cosine similarity of the polarity field with the full and
-  the deformation velocity (`coupling_pv`, `coupling_pvdef`). This is the collective-actuation
-  order parameter: whether the active driving aligns with the mechanical response.
-- **Per-mode actuation spectrum** — temporal correlation `corr(C_i, A_i)` between the polarity
-  projection and the velocity projection on each mode; tests whether polarity and motion
-  condense on the *same* mode.
-- **Participation ratio & spectral entropy** — of the deformation modal energy; a low
-  participation ratio signals energy condensing into few modes (selective actuation).
-- **Modal displacement amplitudes `Q`** — body-frame deformation (`pos − aligned reference`,
-  aligned via centroid + `body_angle`) projected onto the modes; used for phase portraits and
-  the harmonic-PE check.
-- **Phase portraits** — dominant deformation-mode pair (by displacement variance) *and* the
-  first two non-zero modes (modes 3 vs 4) explicitly. A closed orbit is the collective-actuation
-  signature; a degenerate pair traversed in quadrature is the canonical actuated state.
-- **Equipartition / per-mode effective temperature** — `T_kin = 2⟨KE_i⟩` and
-  `T_pot = λ_i⟨Q_i²⟩`; deviation from flat is the non-equilibrium signature.
-- **Chirality** — mean/std body angular velocity `⟨ω⟩`, net-polarization rotation rate, and the
-  signed orbit chirality `⟨q_a q̇_b − q_b q̇_a⟩` of the dominant pair.
-- **Orientational autocorrelation + persistence time** and **VACF** — complementary to `D_r`;
-  persistence time from the 1/e crossing of `⟨cos Δθ⟩`.
-- **Net active force vs CoM motion** — `F = Σ(cosθ, sinθ)` vs `v_cm`, alignment time series and
-  scatter; how efficiently alignment converts to locomotion.
-- **Spatial polarity structure** — bond alignment `⟨cos(θ_i − θ_j)⟩` over connections, and the
-  ring **winding number** of the caster field.
-
-### Sanity checks (printed to the summary)
-
-Equivalent quantities that must agree, verified to machine precision on validated data:
-- `Σ modal KE == KE_deform` (Parseval of the deformation velocity);
-- `v_rigid · v_def == 0` (orthogonality of the rigid-body removal);
-- `KE_zero + KE_deform == KE_total`;
-- `Σ caster proj² == |θ|²` (graph-Laplacian) and `== |p|²` (elastic) (Parseval of both bases);
-- `KE + PE == E_total`;
-- harmonic PE vs spring PE (approximate small-deformation cross-check, using body-frame `Q`);
-- participation ratio within `[1, 2N]`, `|coupling| ≤ 1` (bounds).
-
-**Assumptions**
-- Deformations are small enough for the linearized (harmonic) mode picture to be informative;
-  the harmonic-PE cross-check quantifies how far this holds.
-- The passive Hessian is a valid basis for describing (not predicting) the dynamics.
-- Ring node ids are ordered consistently with the template; non-star topologies fall back to a
-  mean-shape reference with a warning.
-- A near-zero third eigenvalue can appear if `--l0` differs slightly from the reference bond
-  length (tiny pre-tension); the 3 lowest modes are always treated as rigid regardless.
+**Assumptions** — a single ring of identical nodes; the template is a regular N-gon; small
+enough deformation for the linear modes to be a useful basis (sectors stay well defined at
+large amplitude because they are fixed by symmetry, not by λ).
 
 ---
 
@@ -436,13 +384,15 @@ calculations** — it only visualizes stored quantities.
   `analyze_modes.py` to repopulate them.
 
 **Figures**
-1. CoM trajectory (time-colored)  2. CoM 2D PDF  3. Energies (KE/PE/E)  4. Rigid-body KE
-fraction  5. Caster zero-mode fractions (both bases)  6. Orientation order parameter
-7. Eigenvalue spectrum + per-mode KE  8. Deformation mode shapes (quiver)  9. Caster MSD +
-diffusion fit  10. PSDs (order parameter, KE/PE, modal-energy heatmap)  11. Collective
-actuation (coupling, actuation spectrum, condensation)  12. Phase portraits (dominant pair +
-first two non-zero modes)  13. Per-mode effective temperature  14. Chirality (ω + polarization
-angle)  15. Orientational ACF + VACF  16. Active force vs CoM velocity  17. Spatial polarity
+1. CoM trajectory (time-colored)  2. CoM 2D PDF  3. Energies (KE and PE = springs + bending,
+separate panels)  4. Rigid-body KE fraction  5. Polar order² (Laplacian uniform mode) and
+polarity overlap with the soft band  6. Orientation order parameter (+ random-heading
+baseline)  7. Eigenvalue spectrum + per-mode KE  8. Deformation mode shapes (quiver)
+9. Heading MSD about the mean spin + diffusion fit  10. PSDs (order parameter, KE/PE,
+modal-amplitude heatmap)  11. Collective actuation (coupling, actuation spectrum,
+condensation)  12. Phase portraits of the dominant and the softest 2-D wave sectors (oriented
+pairs: a circle = travelling wave)  13. Strain-wave order parameter W(t) + per-sector share and
+circulation  14. Chirality (ω + polarization angle)  15. Orientational ACF + VACF  16. Active force vs CoM velocity  17. Spatial polarity
 (bond alignment + winding)  18. Per-node angular-velocity PSD (7 curves)  19. Pairwise node
 velocity correlation heatmap  20. Pairwise heading angular-velocity correlation heatmap
 21. Heading kymograph over the ring (time × node, hue = caster angle)  22. Interior bond-angle
@@ -493,7 +443,7 @@ $PY format_tracks.py ../Data/240226/240226_med_low_1_raw.csv --baseline 0.1689 \
 #   -> ..._robot.csv (+ ..._robot.log)
 
 # 4. Analyze  (--angle-frame body when the sensor provides the heading; lab otherwise)
-$PY analyze_modes.py ../Data/240226/240226_med_low_1_robot.csv --k 1.0 --l0 0.1689 --angle-frame body
+$PY analyze_modes.py ../Data/240226/240226_med_low_1_robot.csv --kappa 0.005 --vel-smooth-window 7 --angle-frame body
 #   -> ..._analysis.npz (+ ..._analysis.txt); modes cached in /Users/.../tplax_paper
 
 # 5. Plot
@@ -503,8 +453,7 @@ $PY plot_analysis.py ../Data/240226/240226_med_low_1_analysis.npz
 
 Per-experiment knobs to remember:
 - **`--baseline`** (steps 3–4): node-to-node rest distance (m); sets the reference lattice.
-- **`--k` / `--l0`** (step 4): spring constant / rest length. Omit `--l0` for a relaxed lattice
-  (no pre-tension; exact zero rotation mode).
+- **`--kappa`** (step 4): bond-bending stiffness; sector identities do not depend on it.
 - **`--angle-frame body`** (step 4): use whenever the sensor is the heading source (tag body-fixed).
 - **`--sensor-angle-units`** (step 3): default `rad` (correct for the observed [0, 2π] range).
 - **`--camera-frame`** (step 3): skip the lab transform if corner tags are unusable.
@@ -604,21 +553,21 @@ arguments are required; all `--flags` are optional with the defaults shown.
 
 | Argument | Default | Description |
 |---|---|---|
-| `robot_csv` (positional) | — | Formatted CSV from `format_tracks.py`. |
-| `--k` | `1.0` | Uniform spring constant. |
-| `--l0` | each bond's equilibrium length | Uniform spring rest length; omit for a relaxed network (no pre-tension). |
-| `--kappa` | `0` (off) | Bond-bending stiffness (harmonic angle springs about the ideal reference angles). Lifts floppy mechanism modes to finite frequency; rigid modes stay at zero. |
-| `--baseline` | CSV header, else derived | Template radius (m); else the mean observed spring length. |
-| `--topology` | `auto` (from CSV header / node count) | Reference topology for the Hessian + body frame (`robot_topology.py`). |
-| `--angle-frame` | `lab` | Caster-angle frame for order parameter/projections/diffusion: `lab` uses `{n}_theta`, `body` uses `{n}_angle`. |
-| `--nematic` | off (polar) | Use nematic order parameter \|⟨e^{2iθ}⟩\| instead of polar. |
-| `--vel-smooth-window` | `0` (off) | Savitzky-Golay window (odd frames) for the velocity estimate; velocity = SG analytic derivative (deriv=1). `0` = plain central difference. Suppresses the finite-difference noise floor in KE. |
-| `--modes-dir` | `/Users/.../tplax_paper` | Shared normal-mode cache directory (keyed by lattice). |
+| `robot_csv` (positional) | — | Formatted CSV from `format_tracks.py` (ring robot). |
+| `--k` | `1.0` | Uniform spring constant (sets the λ scale; arbitrary units). |
+| `--kappa` | `0` (off) | Bond-bending stiffness about the ideal interior angle. Lifts the mechanisms; rigid modes stay at zero; sector identities unchanged. |
+| `--baseline` | CSV header, else derived | Template circumradius (m); else from the mean observed spring length. |
+| `--topology` | `auto` (CSV header / node count) | Reference topology; the wave-sector analysis requires `ring`. |
+| `--angle-frame` | `lab` | Heading frame for order parameter, kymographs, autocorrelations, diffusion. Modal projections always use the body frame. |
+| `--nematic` | off (polar) | Nematic \|⟨e^{2iγ}⟩\| instead of polar. |
+| `--vel-smooth-window` | `0` (off) | Savitzky–Golay window (odd frames) for velocities and modal-amplitude derivatives; `0` = central differences. |
+| `--wave-window` | `1.0` | Averaging window (s) for the windowed strain-wave order parameter `W_win(t)`. |
+| `--modes-dir` | `/Users/.../tplax_paper` | Shared normal-mode cache directory. |
 | `--recompute-modes` | off | Recompute and overwrite the cached modes for this lattice. |
 | `--bins` | `50` | Bins per axis for the CoM 2D histogram. |
-| `--zero-mode-tol` | `1e-6` | Eigenvalue tolerance for reporting how many modes are numerically zero. |
+| `--zero-mode-tol` | `1e-6` | \|λ\| below which a mode counts as a zero mode. |
 | `--output` | `<robot>_analysis.npz` | Output analysis bundle. |
-| `--summary` | `<robot>_analysis.txt` | Output summary (params, sanity checks, scalars). |
+| `--summary` | `<robot>_analysis.txt` | Output summary (params, checks, scalars). |
 
 ## `plot_analysis.py`
 
@@ -650,10 +599,11 @@ arguments are required; all `--flags` are optional with the defaults shown.
   constraint), independent of the cosmetic undistort crop.
 - **Intermittently-detected tags** get heavy interpolation, which suppresses their apparent
   caster diffusion — interpret per-node stats for such tags with care.
-- **Total energy is not conserved** (active, dissipative system); treat `E_total` as an
-  observable.
-- **Lab-frame vs body-frame caster analysis** materially changes diffusion and the modal angle
-  projections; the order parameter is invariant. Default is lab. Provenance (heading source +
+- **No total energy** is computed: the system is active and dissipative, and KE (unit mass)
+  and PE (units of k) are not commensurate.
+- **Lab-frame vs body-frame heading** changes only diffusion, autocorrelations and the
+  kymographs; modal projections always use the body frame and the order parameter is
+  invariant. Default is lab. Provenance (heading source +
   angle frame) is stamped on every figure and into every plot filename so the two are never
   confused.
 - **Sensor-present experiments use a body-fixed tag**, so the tag caster-angle is not the caster

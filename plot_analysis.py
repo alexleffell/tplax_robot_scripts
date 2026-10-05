@@ -7,17 +7,17 @@ output directory. Figures:
 
   1. CoM trajectory (colored by time)
   2. CoM 2D probability density (arena histogram)
-  3. Energies vs time (KE, PE, total)
+  3. Energies vs time (KE, unit mass; PE = springs + bending, units of k; not summed)
   4. Zero-mode / deformation energy ratios vs time
-  5. Caster zero-mode fractions vs time (graph-Laplacian & elastic bases)
-  6. Orientation order parameter vs time
+  5. Polar order² (Laplacian uniform mode) and polarity overlap with the soft band
+  6. Orientation order parameter vs time (with the finite-N random-heading baseline)
   7. Elastic eigenvalue spectrum + time-averaged modal kinetic energy
   8. First few deformation mode shapes (quiver on the reference lattice)
-  9. Caster-angle MSD vs lag with the diffusion fit
- 10. PSDs: order parameter, KE/PE, and a modal-energy PSD heatmap
+  9. Heading MSD after removing each node's mean spin, with the diffusion fit
+ 10. PSDs: order parameter, KE/PE, and a modal-amplitude PSD heatmap
  11. Collective actuation (polarity-velocity coupling, actuation spectrum, condensation)
- 12. Phase portraits (dominant mode pair + first two non-zero modes)
- 13. Per-mode effective temperature (equipartition test)
+ 12. Phase portraits of the dominant and the softest 2-D wave sectors (oriented pairs)
+ 13. Strain-wave order parameter W(t) and per-sector share / circulation
  14. Chirality (body angular velocity + net polarization angle)
  15. Orientational autocorrelation + VACF
  16. Net active force vs CoM velocity
@@ -121,12 +121,18 @@ def main():
     save(fig, "02_com_pdf.png")
 
     # 3. Energies vs time (log scale; spikes span several decades).
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.semilogy(time, d["KE_total"], label="KE", lw=1)
-    ax.semilogy(time, d["PE_total"], label="PE", lw=1)
-    ax.semilogy(time, d["E_total"], label="E total", lw=1.2, color="k")
-    ax.set_xlabel("time"); ax.set_ylabel("energy (log)"); ax.set_title("Energies")
-    ax.legend()
+    fig, axes = plt.subplots(2, 1, figsize=(9, 5.5), sharex=True)
+    axes[0].semilogy(time, d["KE_total"], lw=1, label="KE (total)")
+    if "KE_deform" in d.files:
+        axes[0].semilogy(time, d["KE_deform"], lw=1, label="KE (deformation)")
+    axes[0].set_ylabel("KE (unit mass)"); axes[0].legend()
+    if "PE_spring" in d.files:
+        axes[1].semilogy(time, d["PE_spring"], lw=1, label="springs")
+        if float(np.max(d["PE_bend"])) > 0:
+            axes[1].semilogy(time, d["PE_bend"], lw=1, label="bending")
+    axes[1].semilogy(time, d["PE_total"], lw=1.2, color="k", label="PE total")
+    axes[1].set_ylabel("PE (units of k)"); axes[1].set_xlabel("time"); axes[1].legend()
+    fig.suptitle("Kinetic and elastic energy (different units; not summed)")
     save(fig, "03_energies.png")
 
     # 4. Zero-mode / deformation energy ratio vs time.
@@ -142,11 +148,11 @@ def main():
     # 5. Caster zero-mode fractions vs time.
     fig, ax = plt.subplots(figsize=(9, 4))
     lz, ez = d["lap_zero_ratio"], d["elastic_zero_ratio"]
-    ax.plot(time, lz, lw=1, label=f"graph-Laplacian zero (mean {np.nanmean(lz):.3f})")
-    ax.plot(time, ez, lw=1, label=f"elastic zero (mean {np.nanmean(ez):.3f})")
+    ax.plot(time, lz, lw=1, label=f"polar order² = Laplacian uniform mode (mean {np.nanmean(lz):.3f})")
+    ax.plot(time, ez, lw=1, label=f"polarity overlap with soft band (mean {np.nanmean(ez):.3f})")
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel("time"); ax.set_ylabel("fraction")
-    ax.set_title("Caster-angle energy in zero modes")
+    ax.set_title("Heading field: uniform component and soft-band overlap (body frame)")
     ax.legend()
     save(fig, "05_caster_zero_fractions.png")
 
@@ -155,6 +161,10 @@ def main():
     op = d["order_param"]
     kind = "nematic" if bool(d["is_nematic"]) else "polar"
     ax.plot(time, op, lw=1, color="C3")
+    if "order_param_null" in d.files:
+        ax.axhline(float(d["order_param_null"]), color="0.4", ls="--", lw=1,
+                   label=f"random headings ({float(d['order_param_null']):.2f})")
+        ax.legend()
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel("time"); ax.set_ylabel(r"$\Psi$")
     ax.set_title(f"Orientation order parameter ({kind}), mean {np.nanmean(op):.3f}")
@@ -209,8 +219,8 @@ def main():
     ax.plot(lags, msd.mean(axis=0), color="k", lw=2, label="mean MSD")
     ax.plot(lags, 2 * D_mean * lags, color="C3", ls="--",
             label=fr"$2 D_r t$, $D_r$={D_mean:.3g}")
-    ax.set_xlabel("lag time"); ax.set_ylabel(r"$\langle \Delta\theta^2\rangle$")
-    ax.set_title("Caster-angle MSD (per node + mean)")
+    ax.set_xlabel("lag time"); ax.set_ylabel(r"$\langle \Delta\gamma^2\rangle$ (mean spin removed)")
+    ax.set_title("Heading MSD about each node's mean spin (per node + mean)")
     ax.legend()
     save(fig, "09_caster_msd.png")
 
@@ -224,13 +234,13 @@ def main():
     axes[1].semilogy(f, d["psd_PE"], label="PE")
     axes[1].set_xlabel("frequency"); axes[1].set_ylabel("PSD")
     axes[1].set_title("KE / PE PSD"); axes[1].legend()
-    mep = d["modal_energy_psd"]  # (2N, nf)
+    mep = d["modal_amp_psd"] if "modal_amp_psd" in d.files else d["modal_energy_psd"]
     with np.errstate(divide="ignore"):
         logmep = np.log10(mep + 1e-30)
     im = axes[2].imshow(logmep, origin="lower", aspect="auto",
                         extent=[f[0], f[-1], 0, mep.shape[0]], cmap="viridis")
     axes[2].set_xlabel("frequency"); axes[2].set_ylabel("mode index")
-    axes[2].set_title("Modal-energy PSD (log10)")
+    axes[2].set_title("Modal-amplitude PSD (log10)")
     fig.colorbar(im, ax=axes[2], label=r"$\log_{10}$ PSD")
     save(fig, "10_psds.png")
 
@@ -266,8 +276,20 @@ def main():
     dom = d["dominant_modes"]
     ftn = d["first_two_nonzero"]
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-    for ax, pair, lab in [(axes[0], dom, "dominant pair"),
-                          (axes[1], ftn, "first two non-zero")]:
+    sec_of = {}
+    if "sector_modes" in d.files:
+        for j, sm in enumerate(d["sector_modes"]):
+            for i in sm:
+                if i >= 0:
+                    sec_of[int(i)] = j
+    def sec_label(i):
+        j = sec_of.get(int(i))
+        if j is None or "sector_m" not in d.files:
+            return ""
+        lam = float(d["sector_circulation"][j]) if "sector_circulation" in d.files else np.nan
+        return fr", m={float(d['sector_m'][j]):.0f}, $\Lambda$={lam:+.2f}"
+    for ax, pair, lab in [(axes[0], dom, "dominant sector" + sec_label(dom[0])),
+                          (axes[1], ftn, "softest 2-D sector" + sec_label(ftn[0]))]:
         ia, ib = int(pair[0]), int(pair[1])
         qa, qb = modal_disp[:, ia], modal_disp[:, ib]
         pts = np.stack([qa, qb], axis=-1).reshape(-1, 1, 2)
@@ -282,15 +304,35 @@ def main():
         fig.colorbar(lc, ax=ax, label="time")
     save(fig, "12_phase_portraits.png")
 
-    # 13. Equipartition / per-mode effective temperature.
-    fig, ax = plt.subplots(figsize=(9, 4))
-    modes_x = range(len(d["Teff_kin"]))
-    ax.bar([x - 0.2 for x in modes_x], d["Teff_kin"], width=0.4, label=r"$T_{eff}$ (kinetic)")
-    ax.bar([x + 0.2 for x in modes_x], d["Teff_pot"], width=0.4, label=r"$T_{eff}$ (potential)")
-    ax.set_xlabel("mode index"); ax.set_ylabel("effective temperature")
-    ax.set_title("Per-mode effective temperature (flat = equipartition)")
-    ax.legend()
-    save(fig, "13_equipartition.png")
+    # 13. Strain-wave order parameter: W(t) of the dominant 2-D sector and per-sector bars.
+    if "wave_order_win" in d.files and "sector_share" in d.files:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4), gridspec_kw={"width_ratios": [2, 1]})
+        dsec = int(d["wave_dominant_sector"])
+        mdom = float(d["wave_m"]) if np.isfinite(float(d["wave_m"])) else np.nan
+        axes[0].plot(time, d["wave_order_t"], lw=0.5, color="0.7", label="W(t) instantaneous")
+        axes[0].plot(time, d["wave_order_win"], lw=1.4, color="C3",
+                     label=f"W, {float(d['wave_window']):g} s window")
+        if dsec >= 0:
+            axes[0].plot(time, d["sector_share_t"][:, dsec], lw=1, color="C0", alpha=0.7,
+                         label="share of deformation in sector")
+        axes[0].axhline(0, color="0.6", lw=0.6)
+        axes[0].set_ylim(-1.05, 1.05); axes[0].set_xlabel("time")
+        axes[0].set_ylabel("W = share × circulation")
+        axes[0].set_title(f"Strain-wave order parameter, dominant sector m={mdom:.0f}  "
+                          f"(W={float(d['wave_order']):+.2f}, ⟨|W_win|⟩={float(d['wave_order_abs']):.2f})")
+        axes[0].legend(fontsize=8, loc="lower left")
+        sm, sl, sd = d["sector_m"], d["sector_lambda"], d["sector_dim"]
+        sh, sc = d["sector_share"], d["sector_circulation"]
+        xs = np.arange(len(sm))
+        labs = [f"m={float(m):.0f}\nλ={float(l):.2g}" + ("" if int(dd) == 2 else "\n(1-D)")
+                for m, l, dd in zip(sm, sl, sd)]
+        axes[1].bar(xs - 0.2, sh, 0.4, color="C0", label="share")
+        axes[1].bar(xs + 0.2, np.nan_to_num(sc), 0.4, color="C3", label=r"circulation $\Lambda$")
+        axes[1].axhline(0, color="0.6", lw=0.6)
+        axes[1].set_xticks(xs); axes[1].set_xticklabels(labs, fontsize=7)
+        axes[1].set_ylim(-1.05, 1.05); axes[1].legend(fontsize=8)
+        axes[1].set_title("Sectors (rigid excluded)")
+        save(fig, "13_strain_wave.png")
 
     # 14. Chirality: body angular velocity and net polarization angle.
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
@@ -301,8 +343,8 @@ def main():
     axes[0].set_title("Body angular velocity"); axes[0].legend()
     axes[1].plot(time, d["pol_angle"], lw=1, color="C5")
     axes[1].set_xlabel("time"); axes[1].set_ylabel("net polarization angle (unwrapped)")
-    axes[1].set_title(fr"Polarization rotation (rate {float(d['pol_rot_rate']):.3g}, "
-                      fr"orbit chirality {float(d['orbit_chirality']):.3g})")
+    axes[1].set_title(fr"Polarization rotation (rate {float(d['pol_rot_rate']):.3g}; "
+                      fr"wave circulation {float(d['orbit_chirality']):+.2f})")
     save(fig, "14_chirality.png")
 
     # 15. Orientational autocorrelation and VACF.
@@ -500,7 +542,7 @@ def main():
     if "vel" in d.files and "eigenvectors" in d.files and "modal_KE" in d.files:
         evecs = d["eigenvectors"]
         twoN = evecs.shape[0]
-        Vf = np.asarray(d["vel"]).reshape(len(time), -1)
+        Vf = np.asarray(d["vel_body"] if "vel_body" in d.files else d["vel"]).reshape(len(time), -1)
         ke_all = 0.5 * (Vf @ evecs) ** 2                     # (T, 2N) full-velocity modal KE
         ke_def = np.asarray(d["modal_KE"])                   # (T, 2N) rigid-removed modal KE
         pe = 0.5 * np.asarray(d["eigenvalues"])[None, :] * np.asarray(d["modal_disp"]) ** 2

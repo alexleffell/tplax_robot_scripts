@@ -30,6 +30,9 @@ import numpy as np
 import pandas as pd
 from pupil_apriltags import Detector
 
+SUBPIX_WIN = 5                    # cornerSubPix half-window (px); search box is 11 x 11
+SUBPIX_MARGIN = SUBPIX_WIN + 1    # corners closer than this to the frame edge are not refined
+
 # Fallback intrinsics (air-table calibration) used only when --calib is omitted.
 DEFAULT_CAMERA_MATRIX = np.array([
     [3.21321589e+03, 0.00000000e+00, 1.49873167e+03],
@@ -135,6 +138,10 @@ def main():
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if not cap.isOpened() or total_frames <= 0 or frame_width <= 0:
+        # Fail loudly: an empty _raw.csv would otherwise look "done" to run_pipeline.sh.
+        raise SystemExit(f"ERROR: cannot read video {args.video_path} "
+                         f"({total_frames} frames, {frame_width}x{frame_height}); no output written.")
     print(f"Video loaded: {total_frames} frames, {frame_width}x{frame_height}, {fps} FPS")
 
     # Guardrail: anisotropic focal lengths indicate a degenerate pinhole calibration
@@ -170,6 +177,7 @@ def main():
     subpix_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
 
     results = []
+    n_subpix_skipped = 0
     frame_count = 0
     while cap.isOpened() and frame_count < total_frames:
         ret, frame = cap.read()
@@ -186,9 +194,20 @@ def main():
 
             img_points = np.array(r.corners, dtype=np.float32)
             if args.subpix:
-                refined = img_points.reshape(-1, 1, 2).copy()
-                cv2.cornerSubPix(image, refined, (5, 5), (-1, -1), subpix_criteria)
-                img_points = refined.reshape(-1, 2)
+                # cornerSubPix needs every corner (and its search window) inside the image;
+                # tags clipped by the frame edge keep the detector's corners.
+                h_img, w_img = image.shape[:2]
+                inside = ((img_points[:, 0] >= SUBPIX_MARGIN)
+                          & (img_points[:, 0] <= w_img - 1 - SUBPIX_MARGIN)
+                          & (img_points[:, 1] >= SUBPIX_MARGIN)
+                          & (img_points[:, 1] <= h_img - 1 - SUBPIX_MARGIN)).all()
+                if inside:
+                    refined = img_points.reshape(-1, 1, 2).copy()
+                    cv2.cornerSubPix(image, refined, (SUBPIX_WIN, SUBPIX_WIN), (-1, -1),
+                                     subpix_criteria)
+                    img_points = refined.reshape(-1, 2)
+                else:
+                    n_subpix_skipped += 1
 
             obj_points = obj_corner if r.tag_id in corner_ids else obj_node
             if calib_model == "fisheye":
@@ -282,6 +301,9 @@ def main():
             f.write(f"# {key}: {value}\n")
         df.to_csv(f, index=False)
 
+    if args.subpix:
+        print(f"Sub-pixel refinement skipped for {n_subpix_skipped} detection(s) with a corner "
+              f"within {SUBPIX_MARGIN} px of the frame edge (detector corners used).")
     print(f"\nWrote {len(df)} detections to {output_csv}")
     print("Processing complete. --- %.2f seconds ---" % (time.time() - start_time))
 

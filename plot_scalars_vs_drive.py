@@ -28,19 +28,25 @@ import matplotlib.pyplot as plt
 
 # (label, npz_key, reduction): reduction is "scalar" (0-d value) or "mean" (nanmean of a series).
 SCALARS = [
+    ("strain-wave order parameter W",        "wave_order",               "scalar"),
+    ("mean |windowed W|",                    "wave_order_abs",           "scalar"),
+    ("dominant wave-sector share",           "wave_share",               "scalar"),
+    ("dominant wave-sector circulation",     "wave_circulation",         "scalar"),
+    ("sector participation ratio",           "sector_participation",     "mean"),
     ("mean order parameter",                 "order_param",              "mean"),
-    ("caster diffusion D_r",                 "D_mean",                   "scalar"),
+    ("order parameter random baseline",      "order_param_null",         "scalar"),
+    ("rot. diffusion about mean spin D_r",   "D_mean",                   "scalar"),
     ("mean zero-mode (rigid) KE fraction",   "zero_mode_KE_ratio",       "mean"),
-    ("mean caster zero fraction (Laplacian)", "lap_zero_ratio",          "mean"),
-    ("mean caster zero fraction (elastic)",  "elastic_zero_ratio",       "mean"),
-    ("mean participation ratio",             "participation_ratio",      "mean"),
+    ("mean polar order² (Laplacian uniform)", "lap_zero_ratio",          "mean"),
+    ("mean polarity overlap, soft band",     "elastic_zero_ratio",       "mean"),
+    ("mean participation ratio (per mode)",  "participation_ratio",      "mean"),
+    ("mean banded participation ratio",      "band_participation",       "mean"),
     ("mean spectral entropy",                "spectral_entropy",         "mean"),
     ("mean polarity-velocity coupling",      "coupling_pv",              "mean"),
     ("mean polarity-def.-velocity coupling", "coupling_pvdef",           "mean"),
     ("mean body angular velocity",           "mean_omega",               "scalar"),
     ("std body angular velocity",            "std_omega",                "scalar"),
     ("net polarization rotation rate",       "pol_rot_rate",             "scalar"),
-    ("dominant-pair orbit chirality",        "orbit_chirality",          "scalar"),
     ("orientational integral corr. time",    "tau_persist",              "scalar"),
     ("mean internal (deformation) KE",       "KE_deform",                "mean"),
     ("mean rigid-body KE",                   "KE_zero",                  "mean"),
@@ -48,8 +54,7 @@ SCALARS = [
     ("mean ring winding number",             "winding",                  "mean"),
     ("mean active-force / CoM-vel alignment", "mean_force_vel_alignment", "scalar"),
     ("mean KE",                              "KE_total",                 "mean"),
-    ("mean PE",                              "PE_total",                 "mean"),
-    ("mean total energy",                    "E_total",                  "mean"),
+    ("mean PE (springs + bending)",          "PE_total",                 "mean"),
 ]
 
 

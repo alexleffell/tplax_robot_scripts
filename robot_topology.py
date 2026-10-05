@@ -29,6 +29,32 @@ def resolve_topology(topology, n_nodes):
     return TOPOLOGY_BY_NODE_COUNT.get(n_nodes)
 
 
+def ring_cycle(nodes, connections):
+    """Node ids in cycle order if the connections form one simple cycle through every node,
+    starting at the smallest id and stepping to its smaller-id neighbour (so the default
+    [(1,2),...,(6,1)] gives 1,2,...,6). Otherwise None."""
+    nodes = list(nodes)
+    adj = {n: [] for n in nodes}
+    for a, b in connections:
+        if a not in adj or b not in adj:
+            return None
+        adj[a].append(b)
+        adj[b].append(a)
+    if len(nodes) < 3 or any(len(v) != 2 for v in adj.values()):
+        return None
+    start = min(nodes)
+    order, prev, cur = [start], None, start
+    nxt = min(adj[start])
+    while nxt != start:
+        order.append(nxt)
+        prev, cur = cur, nxt
+        a, b = adj[cur]
+        nxt = b if a == prev else a
+        if len(order) > len(nodes):
+            return None
+    return order if len(order) == len(nodes) else None
+
+
 def reference_template(nodes, connections, topology="auto", radius=1.0):
     """Return (template, resolved_topology).
 
@@ -37,7 +63,8 @@ def reference_template(nodes, connections, topology="auto", radius=1.0):
 
     - hub_spoke: max-degree node at the origin; the remaining nodes evenly on a circle of the
       given radius, in ascending id order.
-    - ring: all nodes evenly on a circle of the given radius, in ascending id order.
+    - ring: all nodes evenly on a circle of the given radius, counter-clockwise in the order
+      of the connection cycle (ascending id order if the connections do not form one cycle).
     """
     nodes = list(nodes)
     topo = resolve_topology(topology, len(nodes))
@@ -57,7 +84,7 @@ def reference_template(nodes, connections, topology="auto", radius=1.0):
         return template, topo
 
     if topo == "ring":
-        ring = sorted(nodes)
+        ring = ring_cycle(nodes, connections) or sorted(nodes)
         m = len(ring)
         template = {n: (radius * np.cos(2 * np.pi * k / m),
                         radius * np.sin(2 * np.pi * k / m))
