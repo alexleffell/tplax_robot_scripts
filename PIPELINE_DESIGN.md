@@ -160,6 +160,37 @@ interpolate gaps, transform into the lab frame, compute centroid and body angle.
 
 ## Per-calculation details
 
+- **Node positions: projection onto the table plane (default; `--pnp-depth` restores the raw
+  solvePnP translations).** The tracker's position for a tag is its solvePnP translation
+  `tvec`, i.e. *depth × the viewing ray through the tag centre*. For a 45 mm tag at ~0.9 m the
+  depth is the least-constrained part of the pose: on 051126/l2_d4 it fluctuated by ~15 mm frame
+  to frame (30 mm rms about the table plane), and because x, y scale with depth this leaked
+  into **~7 mm of spurious in-plane jitter per frame** (x-jitter vs depth-jitter correlation
+  −0.9; ray direction x/z, y/z was ~6× quieter than x, y themselves). All node tags ride on the
+  same flat table, so the depth carries no independent information: one plane is fitted (SVD,
+  two rounds of 3·MAD outlier rejection) to every node detection in the video, and each
+  detection is placed where its ray meets that plane. The plane's distance is an average over
+  ~10⁴–10⁵ detections, so the metric scale is preserved while the per-frame depth noise is
+  removed; corner/extra tags are left unchanged. Measured effect (same run): median
+  frame-to-frame position jitter 7.0 → 1.3 mm. **Why the default changed:** the jitter is
+  invisible in trajectories and means, but it dominates anything built from velocities. It
+  inflated `|ż|` in the strain-wave circulation Λ = ⟨Im z̄ż⟩/⟨|z||ż|⟩ (the noise adds to the
+  denominator but averages out of the numerator), so a visibly clean, single-direction m = 2
+  limit cycle read Λ ≈ −0.4, W ≈ −0.2; with the projection the same run gives Λ = −0.975,
+  W ≈ −0.92 and a circular phase portrait. Velocity-based quantities (deformation KE, modal KE,
+  γ̇-free couplings) are likewise cleaner. The log reports the plane (distance, tilt, depth
+  scatter) and the jitter before/after. Assumes a flat, rigid table and tags mounted at a
+  common height; use `--pnp-depth` if that does not hold. Single-node data
+  (`format_tracks_single.py`) is unchanged.
+- **Ring order inferred from the data (default; `--strict-connections` keeps `--connections`
+  as given).** For a ring, the springs join physical neighbours, so the true connections are the
+  nodes' cyclic order around the centroid. That order is taken in every (sub-sampled) frame and
+  compared with `--connections` as an undirected edge set; if they differ and the inferred order
+  holds in ≥ 50 % of frames, the inferred connections are used (loud warning; both lists are
+  written to the CSV header as `connections` / `connections_given`, plus `ring_order_support`).
+  Motivation: in 051126, nodes 3 and 4 were swapped in 6 of 8 builds (physical order 1-2-4-3-5-6),
+  which silently produced a ~0.57-radius "static deformation" and invalid modal/wave results
+  until the order was corrected.
 - **Centroid** = mean of node positions each frame (the natural, unambiguous translational
   coordinate; equals center of mass for equal masses).
 - **`body_angle` (absolute)** via **Procrustes / Kabsch** fit of the node positions to an
@@ -291,6 +322,16 @@ pre-stress), stored in one `.npz` bundle plus a `.txt` summary with checks.
   polarities (`C`). (Before this fix, lab-frame vectors were projected onto body-frame modes,
   which mixes radial and tangential components by sin β and invalidated band/condensation
   results; the harmonic-PE check had been failing at 0.5–388 on every run.)
+- **Ring direction.** `format_tracks.py` and `analyze_modes.py` each detect whether the nodes,
+  taken in connection-cycle order, run counter-clockwise or clockwise around the centroid in the
+  data's x-y axes (`robot_topology.ring_direction`), and build the template with the same sense
+  (a mirror-image template cannot be fitted by a rotation and shows up as deformation ≈ 1.3–1.4
+  ring radii). Warnings: node order monotonic in < 95% of frames (lists the node steps that most
+  often go the wrong way — swapped/mislabelled tags), the ring seen in both senses (tracking
+  swaps), header/analysis disagreement, and RMS deformation > 0.5 ring radii (template
+  mismatch). Winding number and kymographs use counter-clockwise spatial order; wave and
+  rotation signs are counter-clockwise-positive in the data axes (camera frame: y points down,
+  so this is clockwise as seen in the image).
 - **Rigid / mechanism split.** The λ≈0 block is re-based into 3 analytic rigid modes + the
   mechanisms (3 for a 6-ring with κ = 0; lifted to finite λ when κ > 0).
 - **Symmetry-adapted sectors.** The ring is invariant under the one-node rotation S
@@ -320,6 +361,18 @@ pre-stress), stored in one `.npz` bundle plus a `.txt` summary with checks.
   mean share; `wave_order = share·Λ` (signed), `wave_order_abs = ⟨|W_win|⟩` (direction-blind,
   for runs that switch direction). A strain-wave limit cycle gives |W| → 1 (e.g. chiral_1_trim:
   m = 2, share 0.93, Λ = −0.975, W = −0.91, robust to κ = 0 vs 0.005).
+- **Heading-wave order parameter** (`heading_wave_stats`; figure 27). The same construction for
+  the caster headings: body-frame headings in counter-clockwise ring order are decomposed into
+  twist numbers q (ψ_q = (1/N) Σ_k e^{iγ_k} e^{−i2πqk/N}; shares p_q = |ψ_q|² sum to 1; q = 0 is
+  flocking, p_0 = polar order², q = ±1 is the vortex counted by the winding number — the
+  "twisted states" of a ring of phase oscillators, cf. Wiley, Strogatz & Girvan, Chaos 16,
+  015103, 2006). A q-twist whose casters all spin at Ω has ψ_q of fixed size rotating at Ω and a
+  heading pattern travelling at −Ω/q. H = share_q* · Λ_q* (q* = dominant q ≠ 0) is ±1 for a clean
+  travelling twist (the stripes in the heading kymograph), 0 for flocking/disorder/a frozen twist.
+  Locking with the strain wave is tested with the RATE ratio Ω_q* / Ω_strain (1 = the casters turn
+  once per strain-wave cycle); pattern speeds differ by geometry (Ω/q vs Ω/m) and are not the
+  right comparison. Example (051126/l2_d4, one run): q* = −1, share 0.91, Λ −0.996, H ≈ −0.91,
+  rate ratio 1.02, strain wave W ≈ −0.93.
 - **Sector participation ratio** `1/Σ_j share_j²` — λ- and basis-independent condensation
   measure (per-mode PR and the banded PR are kept for comparison; per-mode PR is arbitrary
   inside degenerate bands).
@@ -523,11 +576,13 @@ arguments are required; all `--flags` are optional with the defaults shown.
 | `--corner-ids` | raw-CSV header, else `26 27 28 29` | Corner tag ids used to build the lab frame. |
 | `--arena-size W H` | observed corner spacing | Real lab-rectangle dimensions for the lab transform. |
 | `--camera-frame` | off | Skip the corner-tag lab transform; keep camera-frame positions. |
+| `--strict-connections` | off (= infer the ring order) | Always use `--connections` as given. By default, for a ring, the physical cyclic order inferred from the positions replaces `--connections` when they differ (catches swapped tags). |
+| `--pnp-depth` | off (= project onto the table plane) | Use the raw solvePnP translations for node positions instead of intersecting each tag's viewing ray with the fitted table plane. The default removes PnP depth noise (~7 → 1.3 mm per-frame jitter); see the per-calculation note. |
 | `--sensor-csv` | none | Micro-controller CSV; if given, its (body-frame) `angle_value` supplies the heading and encoder/motor are carried through. |
 | `--sensor-angle-units` | `rad` | Units of the sensor `angle_value` column (`rad` or `deg`). |
 | `--motion-onset-frame` | auto | Manual video motion-onset frame for sensor sync (overrides auto-detection). |
 | `--motion-threshold` | auto | Manual speed threshold for motion-onset detection (overrides the auto noise floor). |
-| `--baseline` | derived from data | Node-to-node template radius (m); does **not** affect the fitted body angle. |
+| `--baseline` | measured rest spacing (0.153 m for the 6-node ring, `robot_topology.DEFAULT_REST_SPACING`) | Rest node-to-node distance (m) for the template; recorded in the CSV header for `analyze_modes.py`. Does **not** affect the fitted body angle. |
 | `--topology` | `auto` (7=hub_spoke, 6=ring) | Reference topology for the body-angle template (from `robot_topology.py`). |
 | `--fps` | raw-CSV header, else 30 | Override the frame rate. |
 | `--output` | `<raw>_robot.csv` | Output wide CSV path. |
@@ -556,7 +611,7 @@ arguments are required; all `--flags` are optional with the defaults shown.
 | `robot_csv` (positional) | — | Formatted CSV from `format_tracks.py` (ring robot). |
 | `--k` | `1.0` | Uniform spring constant (sets the λ scale; arbitrary units). |
 | `--kappa` | `0` (off) | Bond-bending stiffness about the ideal interior angle. Lifts the mechanisms; rigid modes stay at zero; sector identities unchanged. |
-| `--baseline` | CSV header, else derived | Template circumradius (m); else from the mean observed spring length. |
+| `--baseline` | CSV header, else 0.153 m (measured rest spacing of the 6-node ring) | Rest node-to-node distance (m): sets the template (circumradius = spacing for a hexagon), the spring rest lengths and the bending reference. The mean observed spring length is used only for topologies with no measured default. |
 | `--topology` | `auto` (CSV header / node count) | Reference topology; the wave-sector analysis requires `ring`. |
 | `--angle-frame` | `lab` | Heading frame for order parameter, kymographs, autocorrelations, diffusion. Modal projections always use the body frame. |
 | `--nematic` | off (polar) | Nematic \|⟨e^{2iγ}⟩\| instead of polar. |

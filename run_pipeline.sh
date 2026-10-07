@@ -12,7 +12,7 @@
 # CORNER_IDS/VALID_TAGS/PARALLEL/TRACK_THREADS/QUAD_DECIMATE/SUBPIX/HAMMING via the environment.
 #
 # Usage:
-#   bash run_pipeline.sh [DATA_DIR]
+#   bash run_pipeline.sh [DATA_DIR]    # DATA_DIR/*.mp4, or DATA_DIR/*/*.mp4 if DATA_DIR has none
 #   FORCE=1 bash run_pipeline.sh            # re-run the (slow) tracker even if *_raw.csv exists
 #   CALIB=/path/to/calibration.npz FAMILIES=tag36h11 bash run_pipeline.sh /path/to/data
 #   STAGES=track bash run_pipeline.sh /path/to/data        # tracker only
@@ -65,12 +65,31 @@ if has_stage track; then
     [ -f "$CALIB" ] || { echo "ERROR: calibration file not found: $CALIB"; exit 1; }
 fi
 
+# Videos in DATA_DIR; if there are none, look one level down (DATA_DIR/*/*.mp4), e.g. a day folder
+# holding one sub-folder per parameter set. Outputs are written next to each video as usual.
+collect_videos() {
+    local mp4
+    for mp4 in "$@"; do
+        case "$(basename "${mp4%.mp4}")" in *_tagged) continue ;; esac   # skip annotated QC videos
+        videos+=("$mp4")
+    done
+}
 videos=()
-for mp4 in "$DATA_DIR"/*.mp4; do
-    case "$(basename "${mp4%.mp4}")" in *_tagged) continue ;; esac   # skip annotated QC videos
-    videos+=("$mp4")
-done
-[ ${#videos[@]} -gt 0 ] || { echo "No .mp4 files in $DATA_DIR"; exit 0; }
+collect_videos "$DATA_DIR"/*.mp4
+if [ ${#videos[@]} -eq 0 ]; then
+    collect_videos "$DATA_DIR"/*/*.mp4
+    if [ ${#videos[@]} -gt 0 ]; then
+        echo "No .mp4 in $DATA_DIR itself; using ${#videos[@]} video(s) one level down:"
+        for d in "$DATA_DIR"/*/; do
+            n=0
+            for mp4 in "$d"*.mp4; do
+                case "$(basename "${mp4%.mp4}")" in *_tagged) ;; *) n=$((n + 1)) ;; esac
+            done
+            [ "$n" -gt 0 ] && echo "  $(basename "$d"): $n"
+        done
+    fi
+fi
+[ ${#videos[@]} -gt 0 ] || { echo "No .mp4 files in $DATA_DIR or its immediate sub-folders"; exit 0; }
 
 # ---------------------------------------------------------------------------- #
 # 1. Tracking, PARALLEL videos at a time (skip if *_raw.csv exists unless FORCE=1).

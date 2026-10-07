@@ -29,6 +29,11 @@ on k or κ for their identity. For each 2-D sector j:
   Ω_j         = ⟨Im(z̄ ż)⟩ / ⟨|z|²⟩            mean phase speed (rad/s; pattern turns at Ω_j/m)
   W_j(t)      = share_j · circ_j                strain-wave order parameter (windowed version
                                                  W_win from --wave-window averages)
+Heading wave (heading_wave_stats): the same idea for the caster headings. The body-frame heading
+field around the ring is split into twist numbers q (DFT of e^{iγ_k}); q = 0 is flocking, q = ±1
+the vortex counted by the winding number. H = share_q* · Λ_q* is ±1 for a clean travelling twist
+(the stripes in the heading kymograph) and 0 for flocking, disorder or a frozen twist.
+
 A strain-wave limit cycle (a travelling shear wave = rotation inside one degenerate shear pair)
 gives |W| → 1; a standing oscillation or a spread over sectors gives W → 0.
 Sector condensation (participation ratio over sectors by displacement share) is
@@ -62,7 +67,9 @@ from scipy.linalg import schur
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import welch, savgol_filter
 
-from robot_topology import reference_template, ring_cycle
+from robot_topology import (circumradius_from_spacing, default_rest_spacing,
+                            reference_template, report_ring_direction, resolve_topology,
+                            ring_cycle, ring_direction)
 
 DEFAULT_MODES_DIR = "/Users/alexleffell/Documents/PhD/tplax/tplax_paper"
 
@@ -112,29 +119,40 @@ def interp_angle(s):
 # --------------------------------------------------------------------------- #
 # Reference configuration
 # --------------------------------------------------------------------------- #
-def build_reference(nodes, connections, baseline, topology, X, Y, log):
-    """Idealized reference positions {node: (x, y)} (see robot_topology.py).
+def build_reference(nodes, connections, baseline, topology, X, Y, log, direction=1):
+    """Idealized reference positions {node: (x, y)} (see robot_topology.py) and the rest node
+    spacing used.
 
-    Radius = --baseline if given, else the mean observed spring length. For a regular hexagon
-    the side equals the circumradius; for other N the mean side is converted to a circumradius.
+    Rest node-to-node distance: --baseline / CSV header if set, else the measured default for
+    the topology (0.153 m for the 6-node ring), else (unknown topology only) the mean observed
+    spring length. Converted to the template circumradius (equal for a hexagon).
     """
     col = {n: i for i, n in enumerate(nodes)}
-    r = baseline
-    if r is None:
+    spacing, src = baseline, "--baseline / CSV header"
+    if spacing is None:
+        spacing, src = default_rest_spacing(topology, len(nodes)), "measured default"
+    if spacing is None:
         edge = [np.nanmean(np.hypot(X[:, col[a]] - X[:, col[b]], Y[:, col[a]] - Y[:, col[b]]))
                 for a, b in connections]
         edge = [e for e in edge if np.isfinite(e)]
-        side = float(np.nanmean(edge)) if edge else 1.0
-        r = side / (2 * np.sin(np.pi / len(nodes)))          # side → circumradius
-        log(f"Derived radius from mean spring length {side:.5f}: R = {r:.5f}")
-    template, topo = reference_template(nodes, connections, topology, radius=r)
+        spacing = float(np.nanmean(edge)) if edge else 1.0
+        src = "mean observed spring length (no measured default for this topology)"
+    r = circumradius_from_spacing(spacing, topology, len(nodes))
+    log(f"Rest node spacing {spacing:.4f} m ({src}) -> template circumradius {r:.4f} m")
+    edge_obs = [np.nanmean(np.hypot(X[:, col[a]] - X[:, col[b]], Y[:, col[a]] - Y[:, col[b]]))
+                for a, b in connections]
+    if np.isfinite(edge_obs).any():
+        log(f"  observed mean spring length {np.nanmean(edge_obs):.4f} m "
+            f"({100 * (np.nanmean(edge_obs) / spacing - 1):+.1f}% vs rest)")
+    template, topo = reference_template(nodes, connections, topology, radius=r,
+                                        direction=direction)
     if template is None:
         log(f"WARNING: no built-in template for topology '{topo}' ({len(nodes)} nodes); "
             f"using the time-averaged shape (not repeatable).")
         return {n: (float(np.nanmean(X[:, col[n]])), float(np.nanmean(Y[:, col[n]])))
-                for n in nodes}, topo
+                for n in nodes}, topo, spacing
     log(f"Reference: topology={topo}, circumradius={r:.5f}")
-    return template, topo
+    return template, topo, spacing
 
 
 # --------------------------------------------------------------------------- #
@@ -320,18 +338,20 @@ def _canon_connections(connections):
     return sorted(tuple(sorted(c)) for c in connections)
 
 
-def lattice_signature(nodes, connections, k, radius, kappa=0.0):
+def lattice_signature(nodes, connections, k, radius, kappa=0.0, direction=1):
     parts = {"nodes": list(nodes), "connections": _canon_connections(connections),
              "k": round(float(k), 8), "l0": None, "kappa": round(float(kappa), 8)}
     if kappa and kappa > 0:
         parts["radius"] = round(float(radius), 4)
+    if direction < 0:
+        parts["direction"] = -1                      # CCW keys stay identical to older caches
     return hashlib.md5(repr(parts).encode()).hexdigest()[:12]
 
 
 def load_or_build_modes(K, nodes, connections, k, radius, ref_arr, modes_dir, recompute, log,
-                        kappa=0.0):
+                        kappa=0.0, direction=1):
     os.makedirs(modes_dir, exist_ok=True)
-    sig = lattice_signature(nodes, connections, k, radius, kappa)
+    sig = lattice_signature(nodes, connections, k, radius, kappa, direction)
     path = os.path.join(modes_dir, f"modes_{sig}.npz")
     canon = _canon_connections(connections)
     if os.path.exists(path) and not recompute:
@@ -401,6 +421,46 @@ def time_derivative(x, dt, window):
     return np.gradient(x, dt, axis=0)
 
 
+def heading_wave_stats(H, dt, sg_window, win):
+    """Twisted-state (heading-wave) decomposition of the caster heading field on the ring.
+
+    H: (T, m) headings, nodes in counter-clockwise ring order k = 0..m−1, BODY frame (rigid
+    rotation removed, like the strain wave). For each twist number q (q = 0, ±1, …, from the
+    DFT) ψ_q(t) = (1/m) Σ_k e^{iγ_k} e^{−i2πqk/m}; p_q = |ψ_q|² sums to 1 over q (p_0 = polar
+    order² = flocking). A q-twist (each heading offset by 2πq/m from its neighbour; q = ±1 is
+    the vortex counted by the winding number) whose casters all spin at rate Ω has ψ_q of fixed
+    size rotating at Ω, and the heading pattern travels around the ring at −Ω/q (CCW
+    positive). Per q: share ⟨p_q⟩, circulation Λ_q = ⟨Im ψ̄ψ̇⟩/⟨|ψ||ψ̇|⟩, spin Ω_q =
+    ⟨Im ψ̄ψ̇⟩/⟨|ψ|²⟩, travel speed −Ω_q/q (NaN for q = 0 and the alias-ambiguous q = m/2).
+    The dominant twist q* is the q ≠ 0 with the largest share; the heading-wave order parameter
+    is H = share_q* · Λ_q* (±1 for a clean travelling twist, 0 for flocking / disorder /
+    a frozen twist), with windowed H_win(t) as for the strain wave."""
+    T, m = H.shape
+    q = np.rint(np.fft.fftfreq(m) * m).astype(int)
+    psi = np.fft.fft(np.exp(1j * H), axis=1) / m
+    p = np.abs(psi) ** 2
+    psid = (time_derivative(psi.real, dt, sg_window)
+            + 1j * time_derivative(psi.imag, dt, sg_window))
+    L = np.imag(np.conj(psi) * psid)
+    den = np.abs(psi) * np.abs(psid)
+    share = p.mean(axis=0)
+    lam = np.divide(L.mean(axis=0), den.mean(axis=0), out=np.zeros(m), where=den.mean(axis=0) > 0)
+    spin = np.divide(L.mean(axis=0), share, out=np.zeros(m), where=share > 0)
+    speed = np.full(m, np.nan)
+    ok = (q != 0) & (2 * np.abs(q) != m)
+    speed[ok] = -spin[ok] / q[ok]
+    sm = lambda x: uniform_filter1d(x, size=win, axis=0, mode="nearest")
+    sden = sm(den)
+    H_w = sm(p) * np.divide(sm(L), sden, out=np.zeros_like(L), where=sden > 0)
+    cand = np.flatnonzero(q != 0)
+    j = int(cand[np.argmax(share[cand])])
+    circ_t = np.divide(L[:, j], den[:, j], out=np.zeros(T), where=den[:, j] > 0)
+    return dict(q=q, share=share, circulation=lam, spin=spin, travel_speed=speed, share_t=p,
+                q_star=int(q[j]), j_star=j, H=float(share[j] * lam[j]), H_t=p[:, j] * circ_t,
+                H_win=H_w[:, j], abs_win=float(np.mean(np.abs(H_w[:, j]))),
+                flock_share=float(share[q == 0][0]))
+
+
 def angular_msd_detrended(theta_t, t):
     """Rotational diffusion about the deterministic spin: unwrap, remove the mean rotation rate
     (least-squares slope), MSD of the residual; D_r = slope/2 over the first half of lags up
@@ -448,8 +508,9 @@ def parse_args():
                         "Sector identities (m) do not depend on it; eigenvalues and the "
                         "radial/tangential mix inside a sector do.")
     p.add_argument("--baseline", type=float, default=None,
-                   help="Template circumradius (m). Default: CSV header, else from the mean "
-                        "spring length.")
+                   help="Rest node-to-node (spring) distance (m). Default: CSV header, else the "
+                        "measured value for the topology (0.153 m for the 6-node ring). Sets the "
+                        "template, spring rest lengths and the bending reference.")
     p.add_argument("--topology", type=str, default="auto",
                    help="Reference topology ('auto' = CSV header / node count). The wave "
                         "analysis requires 'ring'.")
@@ -535,14 +596,25 @@ def main():
 
     # --- Reference, Hessian, modes ---------------------------------------- #
     topology = args.topology if args.topology != "auto" else meta.get("topology", "auto")
-    ref, topo = build_reference(nodes, connections, baseline, topology, X, Y, log)
+    ring_dir, ring_info, cyc = 1, None, ring_cycle(nodes, connections)
+    if resolve_topology(topology, N) == "ring" and cyc is not None:
+        ring_info = ring_direction(pos, [idx[n] for n in cyc])
+        report_ring_direction(ring_info, cyc, log)
+        ring_dir = ring_info["direction"]
+        hdr = meta.get("ring_direction")
+        if hdr is not None and int(hdr) != ring_dir:
+            log(f"WARNING: ring direction in the CSV header ({int(hdr):+d}) differs from the one "
+                f"detected here ({ring_dir:+d}); the body angle in the CSV may be unreliable. "
+                "Using the detected direction (analysis recomputes its own body angle).")
+    ref, topo, rest_spacing = build_reference(nodes, connections, baseline, topology, X, Y, log,
+                                              direction=ring_dir)
     ref_arr = np.array([ref[n] for n in nodes], dtype=float)
     ref_c = ref_arr - ref_arr.mean(axis=0)
     radius = float(np.mean(np.linalg.norm(ref_c, axis=1)))
     K, hinges = build_hessian(nodes, connections, ref, args.k, args.kappa)
     evals, evecs, modes_source = load_or_build_modes(
         K, nodes, connections, args.k, radius, ref_arr, args.modes_dir,
-        args.recompute_modes, log, kappa=args.kappa)
+        args.recompute_modes, log, kappa=args.kappa, direction=ring_dir)
     n_zero_numeric = int(np.sum(np.abs(evals) < args.zero_mode_tol))
     evecs, rigid_idx, mechanism_idx, deform_idx = separate_rigid_mechanism(
         evals, evecs, ref_arr, args.zero_mode_tol)
@@ -645,6 +717,21 @@ def main():
     # ===================================================================== #
     Qdot = time_derivative(Q, dt, args.vel_smooth_window)
     Qd2 = (Q[:, deform_idx] ** 2).sum(axis=1)                # total deformation |q|²
+    rms_def = float(np.sqrt(Qd2.mean() / N) / radius)
+    log(f"RMS per-node deformation / ring radius: {rms_def:.3f}")
+    if rms_def > 0.5:
+        log("WARNING: deformation exceeds half the ring radius on average — the template probably "
+            "does not match the robot (node order / ring direction / rest spacing). Modal and "
+            "wave results are unreliable.")
+    # Sector shares and the wave use deviations from the run's mean shape: a static offset
+    # (e.g. the ring sitting a few % smaller than the rest spacing → constant m=0 breathing, or a
+    # permanent distortion) is not dynamics and would otherwise dilute the share and W.
+    Q_mean = Q.mean(axis=0)
+    Qf = Q - Q_mean[None, :]
+    Qf2 = (Qf[:, deform_idx] ** 2).sum(axis=1)
+    static_frac = float((Q_mean[deform_idx] ** 2).sum() / Qd2.mean()) if Qd2.mean() > 0 else np.nan
+    log(f"Static (time-mean) part of the deformation: {100 * static_frac:.1f}% of ⟨|q|²⟩ "
+        "(excluded from sector shares and W)")
     win = max(3, int(round(args.wave_window * fps)))
 
     def smooth(x):
@@ -654,20 +741,20 @@ def main():
     wave_rows = []                                            # per 2-D sector time series
     for s in sectors:
         i = s["modes"]
-        share = np.divide((Q[:, i] ** 2).sum(axis=1), Qd2, out=np.zeros(T), where=Qd2 > 0)
+        share = np.divide((Qf[:, i] ** 2).sum(axis=1), Qf2, out=np.zeros(T), where=Qf2 > 0)
         sec_share_t.append(share)
         sec_dim.append(s["dim"]); sec_m.append(s["m"]); sec_lam.append(s["lam"])
         sec_modes.append(i + [-1] * (2 - len(i)))
         if s["dim"] == 2:
-            z = Q[:, i[0]] + 1j * Q[:, i[1]]
+            z = Qf[:, i[0]] + 1j * Qf[:, i[1]]
             zd = Qdot[:, i[0]] + 1j * Qdot[:, i[1]]
             L_t = np.imag(np.conj(z) * zd)                    # angular momentum in the pair
             denom = np.abs(z) * np.abs(zd)
             circ = np.divide(L_t, denom, out=np.zeros(T), where=denom > 0)
             Lam = float(L_t.mean() / denom.mean()) if denom.mean() > 0 else 0.0
             Om = float(L_t.mean() / (np.abs(z) ** 2).mean()) if (np.abs(z) ** 2).mean() > 0 else 0.0
-            eta_w = np.divide(smooth((Q[:, i] ** 2).sum(axis=1)), smooth(Qd2),
-                              out=np.zeros(T), where=smooth(Qd2) > 0)
+            eta_w = np.divide(smooth((Qf[:, i] ** 2).sum(axis=1)), smooth(Qf2),
+                              out=np.zeros(T), where=smooth(Qf2) > 0)
             sd = smooth(denom)
             circ_w = np.divide(smooth(L_t), sd, out=np.zeros(T), where=sd > 0)
             amp = np.abs(z)
@@ -675,8 +762,8 @@ def main():
                                   W=share * circ, W_win=eta_w * circ_w, Lam=Lam, Om=Om,
                                   amp_cv=float(amp.std() / amp.mean()) if amp.mean() > 0 else np.nan))
     sec_share_t = np.array(sec_share_t).T                     # (T, n_sec)
-    sector_Q2 = np.array([(Q[:, s["modes"]] ** 2).sum(axis=1).mean() for s in sectors])
-    sector_share = sector_Q2 / Qd2.mean() if Qd2.mean() > 0 else np.zeros(len(sectors))
+    sector_Q2 = np.array([(Qf[:, s["modes"]] ** 2).sum(axis=1).mean() for s in sectors])
+    sector_share = sector_Q2 / Qf2.mean() if Qf2.mean() > 0 else np.zeros(len(sectors))
     sector_KE = np.array([modal_KE[:, s["modes"]].sum(axis=1).mean() for s in sectors])
     sector_drive = np.array([(C[:, s["modes"]] ** 2).sum(axis=1).mean() for s in sectors])
     psec = sec_share_t
@@ -785,7 +872,11 @@ def main():
         bond_align += np.cos(TH[:, idx[a]] - TH[:, idx[b]])
     bond_align /= len(connections)
 
-    ring = ring_cycle(nodes, connections) if topo == "ring" else None
+    # Ring order for winding number / kymographs: counter-clockwise in the data's x-y axes,
+    # whatever the labelling direction, so their signs mean the same thing in every dataset.
+    ring = None
+    if topo == "ring" and cyc is not None:
+        ring = list(cyc) if ring_dir > 0 else [cyc[0]] + list(cyc[:0:-1])
     if ring is not None:
         rcols = [idx[n] for n in ring]
         m_r = len(ring)
@@ -802,7 +893,23 @@ def main():
             interior = np.arctan2(np.abs(u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0]),
                                   (u * v).sum(axis=1))
             bond_angle_dev[:, kk] = interior - bond_angle_baseline
+    # Heading wave (twisted states of the caster field), body frame, CCW ring order.
+    hw = None
+    if ring is not None:
+        ring_headings_body = wrap(th_body[:, rcols])
+        hw = heading_wave_stats(ring_headings_body, dt, args.vel_smooth_window,
+                                max(3, int(round(args.wave_window * fps))))
+        log("Heading twist decomposition (body frame; share p_q, circulation Λ_q, spin Ω_q, "
+            "pattern travel speed −Ω_q/q):")
+        for qq, sh, la, sp, tv in zip(hw["q"], hw["share"], hw["circulation"], hw["spin"],
+                                      hw["travel_speed"]):
+            log(f"  q={qq:+d}: share {sh:.3f}  Λ {la:+.3f}  Ω {sp:+.3f} rad/s  "
+                f"travel {tv:+.3f} rad/s" + ("  (flocking)" if qq == 0 else ""))
+        log(f"HEADING-WAVE ORDER PARAMETER (dominant twist q={hw['q_star']:+d}): "
+            f"H = share·Λ = {hw['H']:+.3f};  ⟨|H_win|⟩ = {hw['abs_win']:.3f}")
     else:
+        ring_headings_body = np.zeros((T, 0))
+    if ring is None:
         winding = np.full(T, np.nan)
         ring_nodes, ring_headings = np.array([]), np.zeros((T, 0))
         bond_angle_dev, bond_angle_baseline = np.zeros((T, 0)), np.nan
@@ -930,7 +1037,22 @@ def main():
         modal_amp_psd=modal_amp_psd, node_omega_psd=node_omega_psd,
         vel_corr=vel_corr, omega_corr=omega_corr,
         mean_polarity=mean_polarity, pod_polarity=pod_polarity, pod_variance=pod_variance,
-        k=args.k, kappa=args.kappa, baseline=(baseline if baseline else np.nan),
+        k=args.k, kappa=args.kappa, baseline=rest_spacing, rest_spacing=rest_spacing,
+        ring_headings_body=ring_headings_body,
+        heading_q=(hw["q"] if hw else np.array([])),
+        heading_share=(hw["share"] if hw else np.array([])),
+        heading_circulation=(hw["circulation"] if hw else np.array([])),
+        heading_spin=(hw["spin"] if hw else np.array([])),
+        heading_travel_speed=(hw["travel_speed"] if hw else np.array([])),
+        heading_share_t=(hw["share_t"] if hw else np.zeros((T, 0))),
+        heading_wave_q=(hw["q_star"] if hw else 0), heading_wave_H=(hw["H"] if hw else np.nan),
+        heading_wave_H_t=(hw["H_t"] if hw else np.zeros(T)),
+        heading_wave_H_win=(hw["H_win"] if hw else np.zeros(T)),
+        heading_wave_abs=(hw["abs_win"] if hw else np.nan),
+        heading_flock_share=(hw["flock_share"] if hw else np.nan),
+        ring_direction=ring_dir, rms_deformation=rms_def, static_deformation_frac=static_frac,
+        modal_disp_mean=Q_mean,
+        ring_monotonic_frac=(ring_info['frac_monotonic'] if ring_info else np.nan),
     )
     with open(summary_path, "w") as f:
         f.write("\n".join(lines) + "\n")

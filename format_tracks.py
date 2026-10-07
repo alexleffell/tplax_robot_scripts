@@ -38,7 +38,9 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from robot_topology import reference_template
+from robot_topology import (circumradius_from_spacing, default_rest_spacing,
+                            infer_ring_order, reference_template, report_ring_direction,
+                            resolve_topology, ring_cycle, ring_direction)
 
 DEFAULT_CONNECTIONS = [(0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6),
                        (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 1)]
@@ -206,6 +208,61 @@ def wrap_angle(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
+def project_to_table_plane(raw, node_ids, log, min_points=50):
+    """Replace node tag positions by the intersection of each tag's viewing ray with the table
+    plane.
+
+    solvePnP depth for a small tag is noisy (~1–2 % of the distance frame to frame), and the
+    tracker's x, y are depth × ray direction, so depth noise leaks into the in-plane position.
+    All node tags ride on the same (flat) table, so: fit one plane to every node detection of
+    the video (SVD, two rounds of 3·MAD outlier rejection), then place each detection where its
+    ray (tvec direction = ray through the tag centre in undistorted coordinates) meets that
+    plane. The plane is the average over many thousand detections, so the metric scale is
+    kept while the per-frame depth noise is removed. Corner/extra tags are left unchanged.
+    """
+    m = (raw["node_id"].isin(node_ids) & np.isfinite(raw["x"]) & np.isfinite(raw["y"])
+         & np.isfinite(raw["z"]) & (raw["z"] > 0))
+    P = raw.loc[m, ["x", "y", "z"]].to_numpy(dtype=float)
+    if len(P) < min_points:
+        log(f"\nPlanar projection skipped: only {len(P)} node detections.")
+        return raw
+    keep = np.ones(len(P), dtype=bool)
+    for _ in range(3):
+        c = P[keep].mean(axis=0)
+        _, _, Vt = np.linalg.svd(P[keep] - c, full_matrices=False)
+        n = Vt[-1] * (1.0 if Vt[-1][2] > 0 else -1.0)
+        res = (P - c) @ n
+        mad = 1.4826 * np.median(np.abs(res[keep] - np.median(res[keep])))
+        keep = np.abs(res - np.median(res[keep])) <= max(3 * mad, 1e-9)
+    dist = float(n @ c)
+    rays = P / P[:, 2:3]                                    # (x/z, y/z, 1)
+    t = dist / (rays @ n)
+    Pp = rays * t[:, None]
+
+    def jitter(df):
+        js = []
+        for _, g in df.groupby("node_id"):
+            g = g.sort_values("frame#")
+            consecutive = np.diff(g["frame#"].to_numpy()) == 1
+            if consecutive.sum() > 10:
+                dx = np.diff(g[["x", "y"]].to_numpy(), 2, axis=0)
+                ok = consecutive[1:] & consecutive[:-1]
+                js.append(np.median(np.linalg.norm(dx[ok], axis=1)))
+        return float(np.median(js)) if js else np.nan
+
+    before = jitter(raw.loc[m])
+    out = raw.copy()
+    out.loc[m, ["x", "y", "z"]] = Pp
+    after = jitter(out.loc[m])
+    tilt = np.degrees(np.arccos(abs(n[2])))
+    log(f"\nPlanar projection onto the table plane (from {keep.sum()} of {len(P)} node detections): "
+        f"distance {dist:.4f} m, tilt {tilt:.2f}° from the image plane, depth scatter about the "
+        f"plane {1e3 * np.std(res[keep]):.1f} mm (rms).")
+    log(f"  median frame-to-frame position jitter (2nd difference): {1e3 * before:.2f} mm -> "
+        f"{1e3 * after:.2f} mm")
+    return out
+
+
 def circ_mean(angles):
     """Circular mean of a 1D array of angles (rad); NaN if empty."""
     angles = np.asarray(angles, dtype=float)
@@ -353,6 +410,15 @@ def parse_args():
     p.add_argument("--camera-frame", action="store_true",
                    help="Skip the corner-tag lab-frame transform and keep all positions in the "
                         "camera frame. (Corner tags still appear as extra tags.)")
+    p.add_argument("--strict-connections", action="store_true",
+                   help="Always use --connections as given. Default: for a ring, if the nodes' "
+                        "physical cyclic order (inferred from positions) differs from "
+                        "--connections, use the inferred order and warn (catches swapped tags).")
+    p.add_argument("--pnp-depth", action="store_true",
+                   help="Use the raw solvePnP translations for node positions. Default: project "
+                        "each node tag's viewing ray onto the table plane fitted to all node "
+                        "detections, which removes per-frame PnP depth noise (several mm of "
+                        "spurious in-plane jitter otherwise).")
     p.add_argument("--sensor-csv", type=str, default=None,
                    help="Optional micro-controller CSV (timestamp_s, timestamp_us, node_id, "
                         "encoder_value, angle_value, motor_command). If given, its (body-frame) "
@@ -364,8 +430,10 @@ def parse_args():
     p.add_argument("--motion-threshold", type=float, default=None,
                    help="Manual speed threshold for motion-onset detection (overrides auto noise floor).")
     p.add_argument("--baseline", type=float, default=None,
-                   help="Node-to-node distance for the template. If omitted, derived from data. "
-                        "(Only sets the template radius; does not affect the fitted body_angle.)")
+                   help="Rest node-to-node (spring) distance (m) for the template. Default: the "
+                        "measured value for the topology (robot_topology.DEFAULT_REST_SPACING, "
+                        "0.153 m for the 6-node ring). Recorded in the CSV header and used by "
+                        "analyze_modes.py; it does not affect the fitted body_angle.")
     p.add_argument("--topology", type=str, default="auto",
                    help="Reference topology for the body-angle template: 'auto' (by node count: "
                         "7=hub_spoke, 6=ring), or an explicit name from robot_topology.py.")
@@ -422,6 +490,12 @@ def main():
                 f"\"[(1,2),(2,3),(3,4),(4,5),(5,6),(6,1)]\").")
             log("!" * 70)
 
+    # Planar projection of node positions (removes PnP depth noise; see project_to_table_plane).
+    if not args.pnp_depth:
+        raw = project_to_table_plane(raw, nodes, log)
+    else:
+        log("\nPlanar projection disabled (--pnp-depth): using raw solvePnP translations.")
+
     # Interpolate, then pivot to per-frame arrays.
     interp = interpolate_tracks(raw, total_frames, log)
     xw = pivot_series(interp, total_frames, "x")
@@ -467,15 +541,67 @@ def main():
     # --- Template for absolute body angle --------------------------------- #
     # Idealized per-topology reference (repeatable across experiments; a flexible robot's
     # mean shape is not). Radius is irrelevant to the body angle (Kabsch is scale-invariant).
-    template, topology = reference_template(nodes, connections, args.topology,
-                                            radius=(args.baseline or 1.0))
+    if args.baseline is None:
+        args.baseline = default_rest_spacing(args.topology, len(nodes))
+    radius = (circumradius_from_spacing(args.baseline, args.topology, len(nodes))
+              if args.baseline else 1.0)
+    # Ring order: the springs join physical neighbours, so the true connections are given by the
+    # nodes' cyclic order around the ring. If --connections disagrees (e.g. two tags swapped
+    # between builds) use the order inferred from the positions, unless --strict-connections.
+    connections_given = list(connections)
+    ring_support = np.nan
+    if (resolve_topology(args.topology, len(nodes)) == "ring"
+            and all(n in xw.columns for n in nodes)):
+        xy_all = np.stack([np.stack([xw[n].values, yw[n].values], axis=-1) for n in nodes], axis=1)
+        inferred, ring_support = infer_ring_order(xy_all, nodes)
+        if inferred is None:
+            log("WARNING: could not infer the ring order (no frame with every node).")
+        else:
+            inf_edges = {frozenset((inferred[i], inferred[(i + 1) % len(inferred)]))
+                         for i in range(len(inferred))}
+            given_edges = {frozenset(c) for c in connections}
+            if inf_edges == given_edges:
+                log(f"Ring order matches --connections ({100 * ring_support:.1f}% of frames).")
+            elif args.strict_connections:
+                log(f"WARNING: --connections {connections} do not match the physical ring order "
+                    f"{inferred} ({100 * ring_support:.1f}% of frames); keeping them because "
+                    "--strict-connections is set. Modal/wave results will be wrong.")
+            elif ring_support < 0.5:
+                log(f"WARNING: --connections {connections} do not match the most common ring order "
+                    f"{inferred}, but that order holds in only {100 * ring_support:.1f}% of frames; "
+                    "keeping --connections. Check the tag labelling.")
+            else:
+                connections = [(inferred[i], inferred[(i + 1) % len(inferred)])
+                               for i in range(len(inferred))]
+                log("!" * 70)
+                log(f"WARNING: --connections {connections_given} do not follow the physical ring "
+                    f"order. Using the order inferred from the positions: {inferred} "
+                    f"({100 * ring_support:.1f}% of frames), i.e. connections {connections}. "
+                    "(Likely swapped/mislabelled tags; use --strict-connections to override.)")
+                log("!" * 70)
+    # Ring direction: build the template with the same rotational sense as the data (a
+    # mirror-image template cannot be fitted by a rotation), and warn on non-monotonic order.
+    ring_dir = 1
+    if resolve_topology(args.topology, len(nodes)) == "ring":
+        cyc = ring_cycle(nodes, connections)
+        if cyc is None:
+            log("WARNING: ring topology but the connections do not form one cycle through "
+                "every node; template uses ascending id order.")
+        elif all(n in xw.columns for n in cyc):
+            xy = np.stack([np.stack([xw[n].values, yw[n].values], axis=-1) for n in cyc], axis=1)
+            info = ring_direction(xy, range(len(cyc)))
+            report_ring_direction(info, cyc, log)
+            ring_dir = info["direction"]
+    template, topology = reference_template(nodes, connections, args.topology, radius=radius,
+                                            direction=ring_dir)
     if template is None:
         log(f"WARNING: no built-in template for topology '{topology}' ({len(nodes)} nodes); "
             f"falling back to the (non-repeatable) mean shape. Add it to robot_topology.py.")
         template = mean_shape_template(nodes, xw, yw)
     else:
-        log(f"Reference template: topology={topology} "
-            f"(radius does not affect the body angle).")
+        log(f"Reference template: topology={topology}, rest node spacing "
+            f"{args.baseline if args.baseline else 'unset'} m, circumradius {radius:.4f} m "
+            f"(the radius does not affect the body angle).")
     tmpl_nodes = [n for n in nodes if n in template]
     tmpl_pts = np.array([template[n] for n in tmpl_nodes])
 
@@ -572,10 +698,13 @@ def main():
         "n_nodes": len(nodes),
         "nodes": nodes,
         "connections": connections,
+        "connections_given": connections_given,
+        "ring_order_support": (None if not np.isfinite(ring_support) else round(float(ring_support), 4)),
         "corner_ids": corner_ids,
         "corner_locs": corner_locs,
         "extra_tags": extra_tags,
         "baseline": args.baseline,
+        "ring_direction": ring_dir,
         "arena_size": list(args.arena_size) if args.arena_size else None,
         "frame": frame_label,
         "fps": fps,

@@ -31,6 +31,7 @@ output directory. Figures:
  24. Drive overlap vs response, by mode band
  25. Drive-field vs mode-shape overlay (top non-rigid modes)
  26. Modal energy vs time (per-mode KE all / KE rigid-removed / PE, stacked panels)
+ 27. Heading wave H(t) (twisted states of the caster field) vs strain wave W(t), per-twist bars
 
 Every figure is footer-stamped and filename-tagged with the heading source and angle frame.
 
@@ -561,6 +562,36 @@ def main():
         axes[0].legend(fontsize=6, ncol=2, loc="upper right")
         fig.tight_layout()
         save(fig, "26_modal_energy_vs_time.png")
+
+    # 27. Heading wave (twisted states of the caster field) next to the strain wave.
+    if "heading_wave_H_win" in d.files and np.asarray(d["heading_q"]).size:
+        q = np.asarray(d["heading_q"]); order = np.argsort(q)
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4), gridspec_kw={"width_ratios": [2, 1]})
+        qs = int(d["heading_wave_q"]); js = int(np.flatnonzero(q == qs)[0])
+        axes[0].plot(time, d["heading_wave_H_win"], lw=1.4, color="C2",
+                     label=f"heading wave H (twist q={qs:+d})")
+        if "wave_order_win" in d.files:
+            axes[0].plot(time, d["wave_order_win"], lw=1.2, color="C3", alpha=0.8,
+                         label=f"strain wave W (m={float(d['wave_m']):.0f})")
+        axes[0].plot(time, d["heading_share_t"][:, js], lw=0.8, color="C2", alpha=0.4,
+                     label=f"share of twist q={qs:+d}")
+        axes[0].plot(time, d["heading_share_t"][:, int(np.flatnonzero(q == 0)[0])], lw=0.8,
+                     color="0.5", alpha=0.6, label="share q=0 (flocking)")
+        axes[0].axhline(0, color="0.6", lw=0.6)
+        axes[0].set_ylim(-1.05, 1.05); axes[0].set_xlabel("time")
+        axes[0].set_ylabel("order parameter (windowed)")
+        axes[0].set_title(f"Heading wave H={float(d['heading_wave_H']):+.2f} "
+                          f"(⟨|H_win|⟩={float(d['heading_wave_abs']):.2f}) vs strain wave")
+        axes[0].legend(fontsize=8, loc="lower left")
+        xs = np.arange(len(q))
+        axes[1].bar(xs - 0.2, np.asarray(d["heading_share"])[order], 0.4, color="C2", label="share")
+        axes[1].bar(xs + 0.2, np.asarray(d["heading_circulation"])[order], 0.4, color="C3",
+                    label=r"circulation $\Lambda_q$")
+        axes[1].axhline(0, color="0.6", lw=0.6)
+        axes[1].set_xticks(xs); axes[1].set_xticklabels([f"q={int(v):+d}" for v in q[order]])
+        axes[1].set_ylim(-1.05, 1.05); axes[1].legend(fontsize=8)
+        axes[1].set_title("Heading twists (body frame)")
+        save(fig, "27_heading_wave.png")
 
     print(f"\nWrote {len(saved)} figures to {outdir}/")
 
